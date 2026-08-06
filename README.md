@@ -1,7 +1,4 @@
-<<<<<<< HEAD
-# codefa
-=======
-# Coder AI
+# Codefa
 
 A production-ready Electron desktop coding assistant with multi-provider LLM support and a Pydantic AI agent that can read, write and search files in a sandboxed project folder.
 
@@ -60,15 +57,15 @@ Output lands in `release/`.
 
 ## Keyboard shortcuts
 
-| Shortcut | Action |
-| --- | --- |
-| `Cmd/Ctrl+Enter` | Send chat message |
-| `Cmd/Ctrl+M` | Toggle agent mode (Chat / Code Writer) |
-| `Cmd/Ctrl+P` | Quick-open / search overlay (⌘⇧F for content grep) |
-| `Cmd/Ctrl+B` | Toggle sidebar |
-| `Cmd/Ctrl+,` | Open settings |
-| `Cmd/Ctrl+S` | Save current file |
-| `Cmd/Ctrl+T` | New chat |
+| Shortcut         | Action                                             |
+| ---------------- | -------------------------------------------------- |
+| `Cmd/Ctrl+Enter` | Send chat message                                  |
+| `Cmd/Ctrl+M`     | Toggle agent mode (Chat / Code Writer)             |
+| `Cmd/Ctrl+P`     | Quick-open / search overlay (⌘⇧F for content grep) |
+| `Cmd/Ctrl+B`     | Toggle sidebar                                     |
+| `Cmd/Ctrl+,`     | Open settings                                      |
+| `Cmd/Ctrl+S`     | Save current file                                  |
+| `Cmd/Ctrl+T`     | New chat                                           |
 
 ## Architecture
 
@@ -89,4 +86,5 @@ Output lands in `release/`.
 │ agents.py   Chat / Code Writer agents     │
 └───────────────────────────────────────────┘
 ```
->>>>>>> 499d822 (feat: add project initialization files and backend agent implementation)
+
+> > > > > > > 499d822 (feat: add project initialization files and backend agent implementation)
