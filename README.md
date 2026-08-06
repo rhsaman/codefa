@@ -86,5 +86,3 @@ Output lands in `release/`.
 │ agents.py   Chat / Code Writer agents     │
 └───────────────────────────────────────────┘
 ```
-
-> > > > > > > 499d822 (feat: add project initialization files and backend agent implementation)
