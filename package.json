@@ -1,0 +1,90 @@
+{
+  "name": "coder-ai-assistant",
+  "version": "1.0.0",
+  "description": "Multi-provider AI coding assistant with a Pydantic AI agent sidecar, Monaco editor and file explorer.",
+  "author": "coder",
+  "license": "MIT",
+  "main": "dist-electron/main.js",
+  "type": "module",
+  "scripts": {
+    "setup": "uv sync --project backend",
+    "dev": "vite",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "npm run typecheck && vite build",
+    "preview": "vite preview",
+    "dist": "npm run build && npm run setup && electron-builder",
+    "dist:mac": "npm run build && npm run setup && electron-builder --mac",
+    "dist:win": "npm run build && npm run setup && electron-builder --win",
+    "dist:linux": "npm run build && npm run setup && electron-builder --linux"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "^4.6.0",
+    "monaco-editor": "^0.52.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^9.0.1",
+    "rehype-highlight": "^7.0.1",
+    "remark-gfm": "^4.0.0",
+    "zustand": "^4.5.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "@types/react": "^18.3.10",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^9.0.1",
+    "electron": "^31.4.0",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8",
+    "vite-plugin-electron": "^0.28.8",
+    "vite-plugin-electron-renderer": "^0.14.6",
+    "highlight.js": "^11.10.0"
+  },
+  "build": {
+    "appId": "com.coder.aiassistant",
+    "productName": "Coder AI",
+    "afterSign": "scripts/ad-hoc-sign.mjs",
+    "afterPack": "scripts/after-pack.mjs",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!**/.venv/**"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Development"
+    }
+  }
+}

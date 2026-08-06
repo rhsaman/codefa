@@ -1,0 +1,12 @@
+[project]
+name = "coder-backend"
+version = "0.1.0"
+description = "Pydantic AI agent sidecar for the Coder AI Electron app"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.13.4",
+    "pydantic-ai>=2.14.1",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "ddgs>=9.14.4",
+]
