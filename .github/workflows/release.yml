@@ -122,6 +122,7 @@ jobs:
             release/*.zip
             release/*.exe
             release/*.AppImage
+            release/*.deb
           if-no-files-found: warn
           retention-days: 7
 
