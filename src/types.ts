@@ -55,6 +55,10 @@ export interface Settings {
   compact?: boolean
   recentModels?: string[]
   sidebarOpen?: boolean
+  /** Per-workspace accent color, keyed by workspace key (root path, "" for no project). */
+  workspaceColors?: Record<string, string>
+  /** Workspace keys pinned to the top of the sidebar, most-recently-pinned first. */
+  pinnedWorkspaces?: string[]
 }
 
 export type Role = 'user' | 'assistant' | 'system' | 'tool'

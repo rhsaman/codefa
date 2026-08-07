@@ -309,7 +309,8 @@ def slugify(name: str) -> str:
 
 
 LEARNED_MEMORY_FILE = ".coder/MEMORY.md"
-LEARNED_MEMORY_MAX_BYTES = 8_000
+LEARNED_MEMORY_MAX_BYTES = 50_000
+MEMORY_SEARCH_MAX_RESULTS = 15
 _MEMORY_HEADER = "# Agent Memory\n\n## Important Notes\n"
 
 
@@ -439,6 +440,47 @@ def remove_memory(root: str, subject: str) -> dict:
     if len(kept) == len(bullets):
         return {"path": LEARNED_MEMORY_FILE, "ok": True, "skip": "not found"}
     return _write_memory(target, kept)
+
+
+def search_memory(root: str, query: str, max_results: int = MEMORY_SEARCH_MAX_RESULTS) -> dict:
+    """Search the project's memory bullets for ones relevant to ``query``.
+
+    Now that the memory file can hold many notes (up to
+    ``LEARNED_MEMORY_MAX_BYTES``, no longer small enough to always inline into
+    the system prompt), this lets the agent pull in only what's relevant
+    instead of the whole file. Ranks bullets by keyword overlap — a whole-word
+    match scores higher than a bare substring hit — across every word in
+    ``query``. An empty query returns the most recently added notes instead
+    (the file is append-only, so recency == tail order).
+    """
+    query = (query or "").strip()
+    try:
+        target = resolve_safe(root, LEARNED_MEMORY_FILE)
+    except PathEscapeError as exc:
+        return {"query": query, "error": str(exc)}
+    bullets = _memory_bullets(target)
+    total = len(bullets)
+    if total == 0:
+        return {"query": query, "notes": [], "total": 0}
+    if not query:
+        top = bullets[-max_results:]
+        return {"query": query, "notes": list(reversed(top)), "total": total}
+
+    words = [w for w in re.split(r"\W+", query.lower()) if w]
+    scored: list[tuple[int, int, str]] = []
+    for i, bullet in enumerate(bullets):
+        low = bullet.lower()
+        score = 0
+        for w in words:
+            if re.search(rf"\b{re.escape(w)}\b", low):
+                score += 3
+            elif w in low:
+                score += 1
+        if score > 0:
+            scored.append((-score, -i, bullet))
+    scored.sort()
+    top = [b for _, _, b in scored[:max_results]]
+    return {"query": query, "notes": top, "total": total, "matched": len(scored)}
 
 
 def create_skill(root: str, name: str, description: str, content: str) -> dict:
@@ -1246,6 +1288,32 @@ def make_tool_callbacks(
         emit({"kind": "tool_result", "tool": "memory", "summary": f"ok ({action})"})
         return f"Memory updated ({action}). It will be loaded automatically in future sessions for this project."
 
+    async def search_memory_tool(query: str = "", max_results: int = MEMORY_SEARCH_MAX_RESULTS) -> str:
+        """Search this project's durable memory (.coder/MEMORY.md) for notes relevant to `query`. Memory is NOT pre-loaded into your context anymore (it can hold many notes), so call this to pull in only what's relevant instead of guessing. Use it at the start of non-trivial work, when the request sounds like something covered before, or when stuck on a recurring error — pass a few keywords (e.g. "port config", "auth flow", "test failures"). Leave query empty to see the most recently added notes."""
+        emit({"kind": "tool", "tool": "search_memory", "args": {"query": query}})
+        try:
+            result = search_memory(root, query, max_results)
+        except PathEscapeError as exc:
+            msg = f"invalid path: {exc}"
+            emit({"kind": "tool_result", "tool": "search_memory", "summary": msg})
+            return f"ERROR searching memory: {msg}"
+        if "error" in result:
+            msg = result["error"]
+            emit({"kind": "tool_result", "tool": "search_memory", "summary": msg})
+            return f"ERROR searching memory: {msg}"
+        notes = result.get("notes", [])
+        total = result.get("total", 0)
+        if total == 0:
+            emit({"kind": "tool_result", "tool": "search_memory", "summary": "no notes yet"})
+            return "No memory notes saved yet for this project."
+        if not notes:
+            emit({"kind": "tool_result", "tool": "search_memory", "summary": "no matches"})
+            return f"No saved notes matched {query!r} (out of {total} total notes). Proceed without them."
+        emit({"kind": "tool_result", "tool": "search_memory", "summary": f"{len(notes)}/{total} notes"})
+        body = "\n".join(notes)
+        label = f"matching {query!r}" if query else "most recent"
+        return f"MEMORY NOTES ({label}, {len(notes)} of {total} total)\n{body}"
+
     async def create_skill_tool(
         name: str, description: str = "", content: str = ""
     ) -> str:
@@ -1524,6 +1592,7 @@ def make_tool_callbacks(
         "write_file": write_file_tool,
         "edit_file": edit_file_tool,
         "memory": memory_tool,
+        "search_memory": search_memory_tool,
         "create_skill": create_skill_tool,
         "create_mcp": create_mcp_tool,
         "list_files": list_files_tool,

@@ -587,8 +587,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   />
                   <div className="prompt-actions">
                     <span className="hint">
-                      {fmtBytes(new TextEncoder().encode(memoryText).length)} / {'8 KB'} — agent's own notes,
-                      loaded into every session. Exceeding the cap auto-drops the
+                      {fmtBytes(new TextEncoder().encode(memoryText).length)} / {'50 KB'} — the agent's own
+                      notes. No longer loaded in full every session — the agent calls a search_memory tool
+                      to pull in only what's relevant to the current task. Exceeding the cap drops the
                       oldest notes.
                     </span>
                     <span className="hint">{memMsg}</span>

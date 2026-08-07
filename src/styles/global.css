@@ -302,22 +302,35 @@ textarea {
   font-weight: 500;
 }
 
+.chat-item-edit,
 .chat-item-remove {
   flex: 0 0 auto;
-  width: 20px;
-  height: 20px;
+  width: 24px;
+  height: 24px;
   border-radius: 6px;
   display: none;
   align-items: center;
   justify-content: center;
-  font-size: 15px;
+  font-size: 17px;
   line-height: 1;
   color: var(--text-dim);
 }
 
+.chat-item-edit svg {
+  width: 14px;
+  height: 14px;
+}
+
+.chat-item:hover .chat-item-edit,
 .chat-item:hover .chat-item-remove,
+.chat-item.active .chat-item-edit,
 .chat-item.active .chat-item-remove {
   display: inline-flex;
+}
+
+.chat-item-edit:hover {
+  background: var(--bg-input);
+  color: var(--text);
 }
 
 .chat-item-remove:hover {
@@ -325,17 +338,50 @@ textarea {
   color: #fff;
 }
 
+.chat-rename-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+}
+
 .sidebar-group {
   display: flex;
   flex-direction: column;
 }
 
+.sidebar-group.pinned .sidebar-group-toggle {
+  color: var(--text);
+}
+
 .sidebar-group-head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 3px 6px 3px 8px;
+  border-radius: 8px;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.sidebar-group-head:hover {
+  background: color-mix(in srgb, var(--ws, transparent) 12%, var(--bg-input));
+}
+
+.sidebar-group-toggle {
   display: flex;
   align-items: center;
   gap: 6px;
-  width: 100%;
-  padding: 6px 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 0;
   border: none;
   background: none;
   border-radius: 8px;
@@ -349,9 +395,48 @@ textarea {
     color 0.12s;
 }
 
-.sidebar-group-head:hover {
+.sidebar-group-toggle:hover {
+  color: var(--text);
+}
+
+.sidebar-group-actions {
+  display: none;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.sidebar-group-head:hover .sidebar-group-actions {
+  display: inline-flex;
+}
+
+.sidebar-group-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+}
+
+.sidebar-group-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.sidebar-group-btn:hover {
   background: var(--bg-input);
   color: var(--text);
+}
+
+.sidebar-group-btn.active {
+  color: var(--accent);
+}
+
+.sidebar-group-btn.danger:hover {
+  background: var(--danger);
+  color: #fff;
 }
 
 .sidebar-group-chevron {
@@ -382,13 +467,87 @@ textarea {
   opacity: 0.8;
 }
 
+.sidebar-ws-dot {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid transparent;
+}
+
+.color-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+}
+
+.color-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  animation: popover-in 0.12s ease;
+}
+
+@keyframes popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.color-swatch {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  cursor: pointer;
+  transition: transform 0.12s;
+}
+
+.color-swatch:hover {
+  transform: scale(1.15);
+  border-color: var(--text);
+}
+
+.color-none {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 1px dashed var(--text-dim);
+  color: var(--text-dim);
+  font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.color-none:hover {
+  border-color: var(--text);
+  color: var(--text);
+}
+
 .sidebar-group-chats {
   display: flex;
   flex-direction: column;
   gap: 2px;
   padding-left: 6px;
   margin-left: 8px;
-  border-left: 1px solid var(--border);
+  border-left: 2px solid color-mix(in srgb, var(--ws, var(--border)) 70%, transparent);
 }
 
 .sidebar-footer {
@@ -569,6 +728,36 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  position: relative;
+}
+
+.scroll-jump {
+  position: absolute;
+  right: 18px;
+  bottom: 14px;
+  z-index: 30;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+  animation: popover-in 0.15s ease;
+}
+
+.scroll-jump svg {
+  width: 18px;
+  height: 18px;
+}
+
+.scroll-jump:hover {
+  background: var(--accent-dim);
+  color: var(--text);
 }
 
 .chat-messages {

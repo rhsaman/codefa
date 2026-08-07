@@ -120,6 +120,8 @@ export function ChatPanel() {
   const [wsSkills, setWsSkills] = useState<WorkspaceSkill[]>([]);
   const mcpConnectors = useStore((s) => s.settings.mcpServers ?? {});
   const scrollRef = useRef<HTMLDivElement>(null);
+  const stickToBottom = useRef(true);
+  const [showJump, setShowJump] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastEventAt = useRef(0);
@@ -177,7 +179,16 @@ export function ChatPanel() {
     });
   }, [wroot, attachments]);
 
+  const onChatScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    stickToBottom.current = atBottom;
+    setShowJump(!atBottom);
+  };
+
   useEffect(() => {
+    if (!stickToBottom.current) return;
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [chat?.messages]);
 
@@ -970,7 +981,7 @@ const contextUsed = useMemo(() => {
         </span>
       </div>
 
-      <div className="chat-scroll" ref={scrollRef}>
+      <div className="chat-scroll" ref={scrollRef} onScroll={onChatScroll}>
         <div className="chat-messages" data-dir={dir}>
           {chat.messages.length === 0 && (
             <div className="empty-state">
@@ -988,6 +999,21 @@ const contextUsed = useMemo(() => {
             <ChatMessageView key={m.id} message={m} onRetry={retryMessage} />
           ))}
         </div>
+        {showJump && (
+          <button
+            className="scroll-jump"
+            title="Scroll to bottom"
+            onClick={() => {
+              stickToBottom.current = true;
+              setShowJump(false);
+              scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+            }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 5v14M5 12l7 7 7-7" />
+            </svg>
+          </button>
+        )}
       </div>
 
       <div

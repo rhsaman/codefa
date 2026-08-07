@@ -114,6 +114,8 @@ interface State {
   maxHistory: number
   recentModels: string[]
   sidebarOpen: boolean
+  workspaceColors: Record<string, string>
+  pinnedWorkspaces: string[]
   chats: Chat[]
   activeChatId: string
   settingsOpen: boolean
@@ -150,7 +152,11 @@ interface State {
   setFontSize: (n: number) => void
 
   newChat: (mode?: AgentMode) => string
+  newChatInRoot: (root: string, mode?: AgentMode) => string
   deleteChat: (id: string) => void
+  deleteWorkspace: (key: string) => void
+  setWorkspaceColor: (key: string, color: string) => void
+  togglePinWorkspace: (key: string) => void
   setActiveChat: (id: string) => void
   setChatMode: (id: string, mode: AgentMode) => void
   setChatRoot: (id: string, root: string) => void
@@ -181,6 +187,11 @@ function makeChat(mode: AgentMode = 'chat'): Chat {
   }
 }
 
+/** Stable sidebar workspace key derived from a chat root ("" -> "no project" bucket). */
+export function workspaceKey(root: string): string {
+  return root || '__none__'
+}
+
 export const useStore = create<State>((set, get) => ({
   loaded: false,
   settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {} },
@@ -191,6 +202,8 @@ export const useStore = create<State>((set, get) => ({
   fontSize: 14,
   recentModels: [],
   sidebarOpen: true,
+  workspaceColors: {},
+  pinnedWorkspaces: [],
   chats: [makeChat()],
   activeChatId: '',
   settingsOpen: false,
@@ -265,14 +278,16 @@ export const useStore = create<State>((set, get) => ({
       fontSize,
       recentModels: Array.isArray(raw.recentModels) ? raw.recentModels.slice(0, 20) : [],
       sidebarOpen: raw.sidebarOpen !== false,
+      workspaceColors: raw.workspaceColors ?? {},
+      pinnedWorkspaces: Array.isArray(raw.pinnedWorkspaces) ? raw.pinnedWorkspaces : [],
       chats: loadedChats,
       activeChatId: activeId,
     })
   },
 
   persist: () => {
-    const { settings, chats, root, dir, maxHistory, recentModels, sidebarOpen, fontSize } = get()
-    void api.storeSet('settings', { ...settings, root, dir, maxHistory, recentModels, sidebarOpen, fontSize })
+    const { settings, chats, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, workspaceColors, pinnedWorkspaces } = get()
+    void api.storeSet('settings', { ...settings, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, workspaceColors, pinnedWorkspaces })
     void api.storeSet('chats', chats)
   },
 
@@ -473,12 +488,48 @@ export const useStore = create<State>((set, get) => ({
     return activeChatId
   },
 
+  newChatInRoot: (root, mode) => {
+    const chat = makeChat(mode ?? 'chat')
+    chat.root = root || undefined
+    const activeChatId = chat.id
+    set((st) => ({ chats: [...st.chats, chat], activeChatId }))
+    get().persist()
+    return activeChatId
+  },
+
   deleteChat: (id) =>
     set((s) => {
       const chats = s.chats.filter((c) => c.id !== id)
       const activeChatId = s.activeChatId === id ? (chats[chats.length - 1]?.id ?? '') : s.activeChatId
       get().persist()
       return { chats, activeChatId }
+    }),
+
+  deleteWorkspace: (key) =>
+    set((s) => {
+      const chats = s.chats.filter((c) => workspaceKey(c.root ?? '') !== key)
+      const activeChatId = s.chats.some((c) => c.id === s.activeChatId && workspaceKey(c.root ?? '') !== key)
+        ? s.activeChatId
+        : chats[chats.length - 1]?.id ?? ''
+      get().persist()
+      return { chats, activeChatId }
+    }),
+
+  setWorkspaceColor: (key, color) =>
+    set((s) => {
+      const workspaceColors = { ...s.workspaceColors }
+      if (color) workspaceColors[key] = color
+      else delete workspaceColors[key]
+      get().persist()
+      return { workspaceColors }
+    }),
+
+  togglePinWorkspace: (key) =>
+    set((s) => {
+      const wasPinned = s.pinnedWorkspaces.includes(key)
+      const pinnedWorkspaces = wasPinned ? s.pinnedWorkspaces.filter((k) => k !== key) : [key, ...s.pinnedWorkspaces]
+      get().persist()
+      return { pinnedWorkspaces }
     }),
 
   setActiveChat: (id) => {
