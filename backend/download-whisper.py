@@ -13,7 +13,7 @@ import sys
 
 PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEST = os.path.join(PARENT, "backend", "whisper")
-REPO = "Systran/faster-whisper-small"
+REPO = "Systran/faster-whisper-medium"
 
 
 def main() -> int:
