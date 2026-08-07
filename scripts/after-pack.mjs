@@ -1,4 +1,4 @@
-import { lstatSync, readdirSync, realpathSync } from 'fs'
+import { lstatSync, readdirSync, realpathSync, mkdirSync, cpSync, rmSync, copyFileSync, existsSync } from 'fs'
 import { join, dirname } from 'path'
 import { execSync } from 'child_process'
 
@@ -13,15 +13,22 @@ import { execSync } from 'child_process'
  *    copy dies with EPERM.
  *
  * 2) This hook copies the `.venv` from the SOURCE backend over with
- *    `rsync -a` (fresh inodes, no xattrs, no hardlinks), dereferences the
- *    `uv` interpreter symlinks, and drops `libpython*.dylib` so the bundled
+ *    `rsync` (POSIX) or an fs copy (Windows), dereferences the `uv`
+ *    interpreter symlinks, and drops `libpython*.dylib` so the bundled
  *    Python can run.
  */
 
 function projectVenvCopy(srcBackend, destBackend) {
   const src = join(srcBackend, '.venv')
   const dst = join(destBackend, '.venv')
-  execSync(`mkdir -p "${dst}"`, { stdio: 'ignore' })
+  mkdirSync(dst, { recursive: true })
+  if (process.platform === 'win32') {
+    // Windows has no rsync; fs.cpSync is fine there (no next tool xattr/hardlink issues).
+    cpSync(src, dst, { recursive: true, force: true, dereference: true })
+    return
+  }
+  // macOS / Linux: rsync + fresh inodes avoids the `com.apple.provenance`
+  // xattr / hardlink chmod EPERM problem electron-builder's own copy hits.
   execSync(`rsync -a "${src}/" "${dst}/"`, { stdio: 'ignore' })
 }
 
@@ -37,7 +44,8 @@ function dereferenceTree(root) {
       }
       if (st.isSymbolicLink()) {
         const target = realpathSync(abs)
-        execSync(`rm "${abs}" && cp -L "${target}" "${abs}"`, { stdio: 'ignore' })
+        rmSync(abs, { force: true })
+        copyFileSync(target, abs)
       } else if (st.isDirectory()) {
         walk(abs)
       }
@@ -53,8 +61,8 @@ function installLibPython(venvBin) {
   const dylib = readdirSync(realLibDir).find((n) => n.startsWith("libpython") && n.endsWith(".dylib"))
   if (!dylib) return
   const target = join(venvBin, "..", "lib", dylib)
-  execSync(`mkdir -p "${dirname(target)}"`, { stdio: 'ignore' })
-  execSync(`cp "${join(realLibDir, dylib)}" "${target}"`, { stdio: 'ignore' })
+  mkdirSync(dirname(target), { recursive: true })
+  copyFileSync(join(realLibDir, dylib), target)
   execSync(`install_name_tool -id "@executable_path/../lib/${dylib}" "${target}"`, { stdio: 'ignore' })
 }
 
@@ -74,8 +82,9 @@ export default async function afterPack(context) {
     // Resolve libpython while `.venv/bin/python` is still the uv symlink; after
     // dereferencing it becomes a real binary whose realpath is itself.
     if (process.platform === "darwin") installLibPython(venvBin)
-    dereferenceTree(venvBin)
-    console.log('after-pack: copied venv via rsync, fixed libpython, dereferenced symlinks')
+    // Windows venvs live in `.venv/Scripts` (no symlinks) — only normalize POSIX.
+    if (existsSync(venvBin)) dereferenceTree(venvBin)
+    console.log('after-pack: copied venv, fixed libpython, dereferenced symlinks')
   } catch (err) {
     console.error('after-pack: failed to normalize backend bundle', err.message)
   }
