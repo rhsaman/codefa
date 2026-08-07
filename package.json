@@ -2,7 +2,7 @@
   "name": "coder-ai-assistant",
   "version": "1.0.6",
   "description": "Multi-provider AI coding assistant with a Pydantic AI agent sidecar, Monaco editor and file explorer.",
-  "author": "coder",
+  "author": { "name": "coder", "email": "coder@users.noreply.github.com" },
   "license": "MIT",
   "main": "dist-electron/main.js",
   "type": "module",
