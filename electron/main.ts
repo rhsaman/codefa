@@ -28,7 +28,7 @@ function createWindow(): void {
     height: 900,
     minWidth: 980,
     minHeight: 640,
-    title: 'Coder AI',
+    title: 'CODEFA',
     backgroundColor: '#1e1e1e',
     autoHideMenuBar: !isDev,
     webPreferences: {

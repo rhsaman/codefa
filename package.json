@@ -42,8 +42,8 @@
     "highlight.js": "^11.10.0"
   },
   "build": {
-    "appId": "com.coder.aiassistant",
-    "productName": "Coder AI",
+    "appId": "com.codefa.app",
+    "productName": "CODEFA",
     "afterSign": "scripts/ad-hoc-sign.mjs",
     "afterPack": "scripts/after-pack.mjs",
     "directories": {

@@ -60,7 +60,7 @@ function installLibPython(venvBin) {
 
 export default async function afterPack(context) {
   const { appOutDir, packager } = context
-  const productName = packager?.appInfo?.productFilename || 'Coder AI'
+  const productName = packager?.appInfo?.productFilename || 'CODEFA'
   const projectDir = packager?.projectDir || process.cwd()
   const srcBackend = join(projectDir, 'backend')
   const backendRoot =

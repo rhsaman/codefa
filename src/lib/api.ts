@@ -31,6 +31,39 @@ export async function fetchSystemPrompts(): Promise<SystemPrompts> {
   return (await res.json()) as SystemPrompts
 }
 
+/**
+ * Transcribe a recorded audio blob using the local Whisper model in the sidecar.
+ * Returns the transcribed text. Fully local and offline (the Whisper "small"
+ * model ships inside the packaged backend/whisper/ folder).
+ */
+export async function transcribeAudio(
+  blob: Blob,
+  onModelLoading?: (loading: boolean) => void,
+): Promise<string> {
+  const url = await ensureSidecar()
+  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
+  const form = new FormData()
+  form.append('audio', blob, 'clip.wav')
+  if (onModelLoading) onModelLoading(true)
+  try {
+    const res = await fetch(`${url}/transcribe`, {
+      method: 'POST',
+      body: form,
+      signal: AbortSignal.timeout(120_000),
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(
+        (body as { detail?: string }).detail || `transcription failed (${res.status})`,
+      )
+    }
+    const data = (await res.json()) as { text: string }
+    return (data.text ?? '').trim()
+  } finally {
+    if (onModelLoading) onModelLoading(false)
+  }
+}
+
 export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> {  const url = await ensureSidecar()
   if (!url) throw new Error('Python agent not ready — run `npm run setup`')
   const params = new URLSearchParams({

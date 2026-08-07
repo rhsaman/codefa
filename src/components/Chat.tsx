@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getActiveProvider, useStore, DEFAULT_MAX_HISTORY } from "../lib/store";
-import { streamChat, fetchModels } from "../lib/api";
+import { streamChat, fetchModels, transcribeAudio } from "../lib/api";
 import { api, workspaceSkills, type WorkspaceSkill } from "../lib/fs";
 import {
   contextPercent,
@@ -110,6 +110,10 @@ export function ChatPanel() {
   const [stalled, setStalled] = useState(false);
   const [skillOpen, setSkillOpen] = useState(false);
   const [liveUsage, setLiveUsage] = useState<number | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaChunksRef = useRef<Blob[]>([]);
   const [skillChips, setSkillChips] = useState<
     Array<{ kind: "skill" | "mcp"; name: string; path?: string }>
   >(chat?.draft?.skillChips ?? []);
@@ -686,6 +690,74 @@ const contextUsed = useMemo(() => {
     setImages((imgs) => imgs.filter((i) => i.path !== path));
   };
 
+  const startRecording = async () => {
+    if (recording || transcribing || busy) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Prefer a format the sidecar's `av` can decode; fall back to whatever the
+      // browser supports (Whisper handles webm/ogg/opus/wav via decode_audio).
+      const mime =
+        MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus"
+          : MediaRecorder.isTypeSupported("audio/webm")
+            ? "audio/webm"
+            : MediaRecorder.isTypeSupported("audio/wav")
+              ? "audio/wav"
+              : "";
+      const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      mediaChunksRef.current = [];
+      rec.ondataavailable = (e) => {
+        if (e.data.size > 0) mediaChunksRef.current.push(e.data);
+      };
+      rec.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        setRecording(false);
+        const type = mediaChunksRef.current[0]?.type ?? mime;
+        const blob = new Blob(mediaChunksRef.current, { type });
+        if (blob.size === 0) return;
+        setTranscribing(true);
+        try {
+          const text = await transcribeAudio(blob, setTranscribing);
+          if (text) {
+            setInput((prev) => (prev ? prev.trimEnd() + " " + text : text));
+            textareaRef.current?.focus();
+          }
+        } catch (err) {
+          window.alert(
+            `Voice transcription failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        } finally {
+          setTranscribing(false);
+        }
+      };
+      mediaRecorderRef.current = rec;
+      rec.start();
+      setRecording(true);
+    } catch (err) {
+      window.alert(
+        `Microphone unavailable: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
+  const stopRecording = () => {
+    const rec = mediaRecorderRef.current;
+    if (rec && rec.state !== "inactive") {
+      rec.stop();
+      mediaRecorderRef.current = null;
+    }
+  };
+
+  const toggleRecording = () => {
+    if (recording) {
+      stopRecording();
+    } else {
+      void startRecording();
+    }
+  };
+
   const startCmd = (at?: number) => {
     const el = textareaRef.current;
     if (!el || busy) return;
@@ -1085,6 +1157,56 @@ const contextUsed = useMemo(() => {
               )}
             </span>
             <div className="composer-actions">
+              <button
+                className={`icon-btn attach-btn mic-btn ${recording ? "recording" : ""} ${transcribing ? "transcribing" : ""}`}
+                onClick={toggleRecording}
+                disabled={busy}
+                title={
+                  transcribing
+                    ? "Transcribing voice…"
+                    : recording
+                      ? "Stop recording"
+                      : "Record voice input"
+                }
+              >
+                {recording ? (
+                  <span className="wave animate" aria-hidden="true">
+                    <span className="wave-bar" />
+                    <span className="wave-bar" />
+                    <span className="wave-bar" />
+                    <span className="wave-bar" />
+                  </span>
+                ) : transcribing ? (
+                  <span className="wave transcribing" aria-hidden="true">
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <circle cx="12" cy="12" r="10" />
+                      <path d="M8 9l0 6" />
+                      <path d="M12 7l0 10" />
+                      <path d="M16 9l0 6" />
+                    </svg>
+                  </span>
+                ) : (
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                    <line x1="12" y1="19" x2="12" y2="22" />
+                  </svg>
+                )}
+              </button>
               <button
                 className="icon-btn attach-btn"
                 onClick={captureRegion}

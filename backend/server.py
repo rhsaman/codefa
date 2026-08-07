@@ -16,7 +16,7 @@ import re
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -24,7 +24,7 @@ from pydantic import BaseModel
 import providers
 from agents import run_agent
 
-app = FastAPI(title="Coder AI agent sidecar")
+app = FastAPI(title="CODEFA agent sidecar")
 
 app.add_middleware(
     CORSMiddleware,
@@ -83,6 +83,61 @@ async def system_prompts() -> dict:
     from agents import SYSTEM_PROMPTS
 
     return {"chat": SYSTEM_PROMPTS["chat"], "codewriter": SYSTEM_PROMPTS["codewriter"]}
+
+
+# Lazy-loaded faster-whisper model (the CTranslate2 "small" model shipped under
+# backend/whisper/). Loaded once on first transcription and cached, so the first
+# request pays the load cost but every later one is fast and fully local+offline.
+_whisper_model = None
+_whisper_model_lock = asyncio.Lock()
+
+
+async def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        async with _whisper_model_lock:
+            if _whisper_model is None:
+                from faster_whisper import WhisperModel
+
+                model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper")
+                _whisper_model = WhisperModel(
+                    model_dir, device="cpu", compute_type="int8"
+                )
+    return _whisper_model
+
+
+@app.post("/transcribe")
+async def transcribe(request: Request) -> dict:
+    """Transcribe a recorded audio clip (multipart 'file') using the local Whisper
+    model. Returns {"text": "..."} or an HTTP error. Fully local and offline.
+    """
+    import io
+
+    from faster_whisper.audio import decode_audio
+
+    form = await request.form()
+    audio = form.get("audio")
+    if audio is None:
+        raise HTTPException(status_code=400, detail="missing 'audio' field")
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty audio")
+
+    try:
+        model = await _get_whisper_model()
+        # faster-whisper's decode_audio uses `av` to decode webm/ogg/opus/wav/mp3
+        # to a float32 PCM array, so any container the browser MediaRecorder emits
+        # is handled without extra conversion code here.
+        pcm = decode_audio(io.BytesIO(data))
+        segments, _info = model.transcribe(
+            pcm, beam_size=5, language=None, vad_filter=False
+        )
+        text = " ".join(seg.text for seg in segments).strip()
+        return {"text": text}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"transcription failed: {exc}") from exc
 
 
 def _sse(obj: dict) -> str:
@@ -229,7 +284,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Coder AI agent sidecar")
+    parser = argparse.ArgumentParser(description="CODEFA agent sidecar")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()

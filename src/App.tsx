@@ -96,7 +96,7 @@ export default function App() {
             <path d="M4 6h16M4 12h16M4 18h10" />
           </svg>
         </button>
-        <span className="app-title">Coder AI</span>
+        <span className="app-title">CODEFA</span>
         <button
           className="workspace-btn"
           title={activeChatRoot || 'No workspace open — pick a folder for this chat'}

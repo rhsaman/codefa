@@ -1,7 +1,7 @@
 [project]
 name = "coder-backend"
 version = "0.1.0"
-description = "Pydantic AI agent sidecar for the Coder AI Electron app"
+description = "Pydantic AI agent sidecar for the CODEFA Electron app"
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.13.4",
@@ -9,4 +9,5 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "ddgs>=9.14.4",
+    "faster-whisper>=1.2.1",
 ]

@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from 'child_process'
+import { execSync, spawn, ChildProcess } from 'child_process'
 import { app } from 'electron'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -38,6 +38,53 @@ function getPythonRunner(backendDir: string): { cmd: string; args: string[] } | 
     return { cmd: venvPython, args: [] }
   }
   return null
+}
+
+/**
+ * Merge the minimal GUI-launched PATH with the user's login-shell PATH.
+ *
+ * When the app is opened from the Dock/Finder (not a terminal), Electron inherits
+ * a stripped PATH (usually just /usr/bin:/bin:...) so CLI tools installed by
+ * Homebrew / Docker Desktop / etc. (e.g. `docker` at /usr/local/bin or
+ * /opt/homebrew/bin) cannot be found by children — including stdio MCP servers
+ * like `docker mcp gateway run`. In dev the shell already provides these, so the
+ * discrepancy only shows up in the packaged .app. The MCP server is spawned by
+ * the Python sidecar, which inherits this process's env, so fixing PATH here
+ * repairs the whole subtree.
+ */
+function shellPath(): string {
+  const current = process.env.PATH || ''
+  const parts = new Set<string>()
+  for (const p of current.split(':')) if (p) parts.add(p)
+  // Common, predictable CLI locations regardless of the launch context.
+  for (const dir of [
+    '/opt/homebrew/bin',
+    '/opt/homebrew/sbin',
+    '/usr/local/bin',
+    '/usr/local/sbin',
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+  ]) {
+    if (fs.existsSync(dir)) parts.add(dir)
+  }
+  // Ask the login shell for the real user PATH and merge it in. macOS GUI apps
+  // don't load shell rc files, so this is the authoritative source for tools the
+  // user installed via brew/nvm etc. Silence errors — a slower/no shell just
+  // falls back to the defaults above.
+  try {
+    const shell = process.env.SHELL || '/bin/zsh'
+    const probe =
+      process.platform === 'darwin'
+        ? `${shell} -l -c 'echo -n "$PATH"'`
+        : `${shell} -c 'echo -n "$PATH"'`
+    const out = execSync(probe, { timeout: 3000, encoding: 'utf8' })
+    for (const p of out.split(':')) if (p) parts.add(p)
+  } catch {
+    /* ignore — defaults above are enough */
+  }
+  return Array.from(parts).join(':')
 }
 
 function findFreePort(): Promise<number> {
@@ -80,18 +127,19 @@ async function doStart(): Promise<SidecarHandle> {
   const runner = getPythonRunner(backendDir)
 
   let child: ChildProcess
+  const childEnv = { ...process.env, PATH: shellPath(), PYTHONIOENCODING: 'utf-8' }
   if (runner) {
     child = spawn(runner.cmd, [...runner.args, path.join(backendDir, 'server.py'), '--port', String(port)], {
       cwd: backendDir,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      env: childEnv,
     })
   } else {
     const args = ['run', '--project', backendDir, 'python', 'server.py', '--port', String(port)]
     child = spawn('uv', args, {
       cwd: backendDir,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      env: childEnv,
     })
   }
 
