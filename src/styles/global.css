@@ -608,7 +608,6 @@ textarea {
   font-weight: 600;
   font-size: 13px;
   letter-spacing: 0.2px;
-  margin-right: auto;
 }
 
 .icon-btn {
@@ -629,6 +628,7 @@ textarea {
 
 .workspace-btn {
   display: inline-flex;
+  margin-left: auto;
   align-items: center;
   gap: 6px;
   max-width: 45vw;
@@ -906,6 +906,17 @@ textarea {
   gap: 8px;
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);
+}
+
+/* Toolbar now renders inside the titlebar via a React portal from ChatPanel */
+.titlebar #titlebar-toolbar {
+  display: contents;
+}
+.titlebar .chat-toolbar {
+  padding: 0;
+  border-bottom: none;
+  gap: 6px;
+  margin-left: 6px;
 }
 
 .chat-scroll {
@@ -2338,6 +2349,8 @@ textarea {
 .context-meter {
   color: var(--text-dim);
   font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .mention-hint {
@@ -3234,6 +3247,8 @@ textarea {
   align-items: center;
   gap: 6px;
   margin-top: 8px;
+  align-self: flex-start;
+  max-width: 100%;
   background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -3242,7 +3257,6 @@ textarea {
   font-family: var(--font-mono);
   color: var(--text);
   cursor: pointer;
-  max-width: 100%;
 }
 
 .nvim-label:hover {
@@ -3264,6 +3278,8 @@ textarea {
 }
 
 .nvim-file {
+  min-width: 0;
+  max-width: clamp(120px, 34vw, 280px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3285,17 +3301,4 @@ textarea {
   background: var(--bg-alt);
   color: var(--text);
   font-size: 12px;
-}
-
-/* ---- toolbar mode select ---- */
-.chat-toolbar .mode-select {
-  padding: 0;
-  justify-content: flex-start;
-}
-
-.chat-toolbar .mode-select .mode-menu {
-  bottom: auto;
-  top: calc(100% + 6px);
-  left: 0;
-  transform: none;
 }

@@ -192,7 +192,7 @@ interface State {
   markToolReverted: (messageId: string, index: number) => void
   truncateTo: (messageId: string) => boolean
   clearChat: (id: string) => void
-  compactChat: (id: string, summary: string) => void
+  compactChat: (id: string, summary: string, keep?: number) => void
   undoMessage: () => boolean
   redoMessage: () => boolean
 
@@ -797,17 +797,23 @@ export const useStore = create<State>((set, get) => ({
     return true
   },
 
-  compactChat: (id, summary) => {
+  compactChat: (id, summary, keep = 0) => {
     set((s) => ({
-      chats: s.chats.map((c) =>
-        c.id === id
-          ? {
-              ...c,
-              messages: [{ id: uid(), role: 'system', content: summary, createdAt: Date.now() }],
-              updatedAt: Date.now(),
-            }
-          : c,
-      ),
+      chats: s.chats.map((c) => {
+        if (c.id !== id) return c
+        const recent =
+          keep > 0
+            ? c.messages.filter((m) => m.role !== 'system').slice(-keep)
+            : []
+        return {
+          ...c,
+          messages: [
+            { id: uid(), role: 'system', content: summary, createdAt: Date.now() },
+            ...recent,
+          ],
+          updatedAt: Date.now(),
+        }
+      }),
     }))
     get().persist()
   },

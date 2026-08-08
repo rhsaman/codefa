@@ -66,6 +66,10 @@ class ChatRequest(BaseModel):
     # the user disabled it). Resolved against the workspace root; ignored if it
     # escapes the root or the auto-mention is off.
     nvim_file: str = ""
+    # Recent-message budget from the client ("Messages to remember"). The
+    # backend uses it to decide how many recent turns to keep verbatim when it
+    # auto-compacts an overflowing context, so recent work is never lost.
+    max_history: int = 10
 
 
 class ModelsRequest(BaseModel):
@@ -299,6 +303,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 permission_gates=PERMISSION_GATES,
                 allow_outside=req.allow_outside,
                 nvim_file=req.nvim_file,
+                max_history=req.max_history,
             ):
                 # --- بخش اصلاح شده برای جلوگیری از خطای AttributeError ---
                 # ابتدا چک می‌کنیم آیا event یک دیکشنری است یا یک شیء

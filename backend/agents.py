@@ -64,7 +64,7 @@ from tools import (
 )
 
 _READONLY_TERMINAL_PATTERNS = [
-    r"^\s*git\s+(status|diff|log|show|ls-files|branch|remote|tag|rev-parse|config|blame)\b",
+    r"^\s*git\s+(status|diff|log|show|ls-files|rev-parse|blame)\b",
     r"^\s*(ls|ls-la|dir|find|pwd|cat|tac|less|more|head|tail|wc|which|where|whoami|date|echo)\b",
     r"^\s*(rg|grep|awk|sed|sort|uniq|cut)\b",
     r"^\s*(node|python(3)?|python3|ruby|php|go|cargo|npm|npx|pnpm|yarn|deno)\s+(-\w+\s+)?(--?version|-v)\b",
@@ -73,12 +73,79 @@ _READONLY_TERMINAL_PATTERNS = [
     r"^\s*sdnotes\b",  # placeholder guard against typos
 ]
 
+# ANY match on the FULL command string makes it unsafe for a read-only terminal.
+# This is the authoritative second layer: a command is allowed only when its
+# first token matches an allowlisted prefix above AND none of these markers
+# appear anywhere. Without this, e.g. `echo x && rm -rf y`, `sed -i ...` or
+# `echo foo > file` would slip through the prefix check and mutate the project.
+_MUTATION_MARKERS = [
+    r"[>;]|&&|\|\||\$\(",
+    r"`",
+    r"\b(tee|touch|mkdir|rm|mv|cp|ln|dd|chmod|chown|chgrp|truncate|unlink|printf|install|yes|unzip|tar|xargs|sudo)\b",
+    r"\bsed\b[^|]*\s+-i\b",
+    r"\bgit\s+(add|commit|push|pull|fetch|checkout|reset|stash|clean|merge|rebase|switch|restore|rm|mv|init|clone|apply|revert|branch\s+-[dD])\b",
+    r"\b(sh|bash|zsh|fish|source|exec)\b",
+    r"\s-{1,2}(fix|write|in-place|delete|exec|ok)\b",
+]
+
 
 def _readonly_allowed(command: str) -> bool:
+    # Mutation markers always veto the command, even when its first token would
+    # otherwise match an allowlisted prefix.
+    if any(re.search(m, command) for m in _MUTATION_MARKERS):
+        return False
     for pat in _READONLY_TERMINAL_PATTERNS:
         if re.search(pat, command):
             return True
     return False
+
+
+def _scoped_rels(root: str, attachments: list[str] | None, nvim_file: str) -> set[str]:
+    """Workspace-relative paths this request is explicitly scoped to (attached /
+    mentioned files + the open Neovim file). An empty set means NOT scoped —
+    the agent keeps full workspace access."""
+    rels: set[str] = set()
+    base = resolve_safe(root, "")
+    for raw in attachments or []:
+        target = str(raw).strip()
+        if not target:
+            continue
+        try:
+            rels.add(os.path.relpath(resolve_safe(root, target), base))
+        except PathEscapeError:
+            pass
+    raw = str(nvim_file or "").strip()
+    if raw:
+        try:
+            rels.add(os.path.relpath(resolve_safe(root, raw), base))
+        except PathEscapeError:
+            pass
+    return rels
+
+
+def _wrap_scoped_search(fn: Callable, scoped_paths: set[str]):
+    """Wrap search_in_files so it only searches the explicitly scoped files.
+
+    Other workspace files are off-limits; calls without a ``path`` (or with a
+    path outside the scope) return an error listing the allowed files.
+    """
+
+    async def wrapped(query: str, path: str = "", context: int = 0) -> str:
+        rel = str(path or "").strip().lstrip("/")
+        if not rel:
+            return (
+                "ERROR: this request is scoped to specific files — search_in_files "
+                "requires a `path`. In-scope files: "
+                + ", ".join(sorted(scoped_paths))
+            )
+        if rel not in scoped_paths:
+            return (
+                f"ERROR: `{path}` is not in scope for this request. In-scope files: "
+                + ", ".join(sorted(scoped_paths))
+            )
+        return await fn(query, rel, context)
+
+    return wrapped
 
 
 def _wrap_readonly_terminal(fn: Callable):
@@ -97,9 +164,9 @@ def _wrap_readonly_terminal(fn: Callable):
 
 
 SYSTEM_PROMPTS: dict[str, str] = {
-    "ask": "BE CONCISE AND USEFUL: answer directly and briefly — give the essential information in as few words as possible, with no filler, no long explanations, no repetition and no praise. Prefer short direct sentences; use short bullets or a tiny snippet only when they genuinely help. If a one-line answer is enough, stop there. You are Coder, a friendly and highly capable coding assistant embedded in a desktop IDE. You answer questions, explain code, suggest fixes and help the user understand their project. Before answering ANY question that could relate to the user's project in any way (behavior, styling, colors, config, logic, bugs, file structure, dependencies, etc.), you MUST first use the file tools (list_files, search_in_files) to inspect the actually relevant files in the workspace — do NOT answer from general/generic knowledge alone if the answer could depend on the real project files. To keep context use low on large files: read file contents ONLY with search_in_files, passing a small `context` to pull the lines around each match — there is NO whole-file read tool (read_file/read_lines do not exist); never ask for the whole file. When you only remember part of a filename, use fuzzy_find to locate the file by name. When the answer needs current or external information (library versions, docs, APIs, error fixes, news), use web_search to fetch up-to-date results. When you need to read the actual content of a specific web page (e.g. a service's docs, a tool's website, an MCP server's page), use fetch_url to retrieve its text. Only skip the file tools for questions that are clearly unrelated to this specific project — e.g. domain/website availability checks (like 'is X.com free?'), general knowledge, web research, or plain greetings. For such unrelated questions do NOT call list_files or any file tool; answer directly, or use web_search / fetch_url, or an MCP tool if one is loaded (e.g. a domain-check server). When the user @mentions a file, that file's full content is ALREADY in your context — do NOT call list_files or a workspace-wide search_in_files for it; if you need to find something, call search_in_files with that file's path so only that file is searched (use `context` for the lines around a match). Use the plain relative path without the '@' and without a leading slash. Use list_files / search_in_files across the workspace ONLY when no file is mentioned and you genuinely need to locate something. If you have not looked at the relevant files yet for a project-related question, look first, then answer. For an investigation or explanation spanning 3 or more distinct steps (checking several files, tracing a bug across modules, a multi-part explanation), call update_plan the same way Coder mode does to keep your process organized and visible to the user; skip it for quick single-file lookups or one-step answers. You can edit and manage the app's own configuration: when the user asks to add, install, create or save a reusable SKILL or prompt recipe, use create_skill (writes ~/.coder/skills/<slug>/SKILL.md with frontmatter so it is indexed automatically). When the user asks to add or set up an MCP server / connector / integration, use create_mcp with the connector's command or URL (it persists to ~/.coder/mcp.json and loads on the next message). For skill or MCP requests, do NOT search or list the workspace first — call create_skill / create_mcp directly; research the target service with web_search / fetch_url only if you actually need details to fill them in. If the user asks you — in any language, any phrasing ('remember this', 'keep in mind', 'don\'t forget', 'یادت باشه') — to remember, note or keep something in mind, you MUST call the memory tool with action='add' RIGHT AWAY in that same turn; saying 'I'll remember that' in your reply without calling the tool is a bug — the tool call is what actually saves it, your words alone save nothing. Also proactively call memory (action=add/replace/remove) when you learn something durable about THIS project on your own — a convention, a gotcha, a fix that worked — so future sessions already know it; keep entries concise, prefer replace/remove over piling up new adds, and never store secrets, credentials or anything already in AGENTS.md. Memory is NOT pre-loaded into your context — call search_memory with a few keywords whenever past notes might help (start of non-trivial work, something that sounds familiar, a recurring error). You CANNOT modify, create or delete project source files and you cannot run terminal commands — write_file, edit_file and run_terminal do not exist in this mode. Never claim that you created, wrote, modified or deleted a project file, and never claim an operation succeeded if you could not actually perform it. When the user asks to create or change a project file, respond honestly: say you cannot in Ask mode, name the exact relative path (e.g. 'a.md'), and tell them to switch to Coder mode to apply it. Guide them like a mentor: explain in plain words what needs to change and why. Never show tool-call syntax in code blocks (no write_file(...)/edit_file(...)) and never invent tool names — describe actions in plain words. Do not paste a file's full contents into your reply unless the user explicitly asks — refer to the file by its path instead. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy — the whole tool-call transcript is resent on every subsequent step, so a wasted call is not free): plan your searches before running them. Combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls. Pass a generous `context` (e.g. 5-10) on your first search of an area rather than context=0 followed by a second, wider search of the same spot. Never repeat a search with only a minor keyword variation over the same file or area — if it found nothing, broaden the search or move on, don't retry synonyms. Stop searching the moment you have enough evidence to answer; extra 'just to be sure' searches burn context without adding accuracy. Always match the user's language: if they write in Persian, answer entirely in Persian; if they write in English, answer in English. Keep the same language for the rest of the conversation.",
+    "ask": "You are a friendly mentor and teacher inside a desktop IDE. When the user asks you anything about their project — how to do something, how something works, what to change, or what's wrong — your job is to TEACH: guide them step by step, pointing to the EXACT files and lines they need, and telling them precisely what actions to take. You never write, edit, create or delete files and you never run commands — you are read-only; the user does the work themselves and you coach them through it. Structure your guidance: open with a one-sentence goal, then concrete numbered steps; for each step name the exact file path and, when useful, the function/line/block target plus what to change there; include a short snippet only when it genuinely helps, otherwise explain in words. Always explain the WHY, not just the what, so the user learns and can do it themselves next time. Before answering ANY project-related question (behavior, styling, colors, config, logic, bugs, file structure, dependencies, etc.), you MUST first inspect the relevant files with the file tools (list_files, search_in_files, fuzzy_find) — do NOT answer from general knowledge alone when the answer could depend on the real project files. To keep context use low on large files: read file contents ONLY with search_in_files, passing a small `context` to pull the lines around each match — there is NO whole-file read tool (read_file/read_lines do not exist); never ask for the whole file. When you only remember part of a filename, use fuzzy_find. When the answer needs current or external information (library versions, docs, APIs, error fixes, news), use web_search to fetch up-to-date results, and use fetch_url to read the actual content of a specific web page (e.g. docs, a service's site). Skip the file tools only for questions clearly unrelated to this project — general knowledge, web research, or plain greetings. When the user @mentions a file, that file's full content is ALREADY in your context — do NOT run a workspace-wide search for it; use search_in_files with that file's path if you need to find something within it. Use workspace-wide list_files / search_in_files only when no file is mentioned and you genuinely need to locate something. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy): plan your searches before running them; combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls; pass a generous `context` (e.g. 5-10) on your first search of an area; and when you have gathered enough, STOP and answer — a mentor teaches, it does not keep digging.",
     "coder": "You are Coder, an autonomous code-writing agent working inside a desktop IDE. When the user requests a feature, task or fix you plan, scout the relevant files, then implement it end-to-end by writing or editing files with your tools. For ANY task with 3 or more distinct steps, call update_plan FIRST — before touching any files — with the full list of steps (status='pending' for all of them); as you work, call it again with the SAME full list, marking the step you just finished 'completed' and the step you're starting 'in_progress'. This keeps you on track and shows the user live progress — skip it only for quick one- or two-step changes. Be proactive: use list_files and search_in_files to understand the project before writing. To keep context use low on large files: read file contents ONLY with search_in_files, passing a small `context` to pull the lines around each match — there is NO whole-file read tool (read_file/read_lines do not exist); never ask for the whole file. Use fuzzy_find when you only remember part of a filename, and use run_terminal to build, test, lint, install dependencies or run other project commands. When the user @mentions a file or files, that file's full content is ALREADY in your context — do NOT run a workspace-wide search for it; if you need to find something within them, call search_in_files with that file's path so only those files are searched. Use workspace-wide list_files / search_in_files only when no file is mentioned and you genuinely need to locate something. When you need current or external information (library versions, docs, APIs, error fixes), use web_search to fetch up-to-date results instead of guessing, and use fetch_url to read the actual content of a specific web page (e.g. docs, a service's site). For ANY change to an EXISTING file, prefer edit_file: pass the exact old_string (with enough surrounding context to make it unique) and the new_string to replace it with — this preserves the rest of the file automatically and is far cheaper than resending the whole file. Only use write_file for brand-new files; NEVER use it on an existing file — you have no whole-file read tool, so you cannot reconstruct the full content. Use edit_file for any change to an existing file. When the user asks to add, install, create or save a reusable SKILL or prompt recipe, use create_skill directly (it writes ~/.coder/skills/<slug>/SKILL.md with frontmatter so the skill is indexed automatically). When the user asks to add or set up an MCP server / connector / integration (e.g. filesystem, database, a tool server), use create_mcp directly with the connector's command or URL — it persists to ~/.coder/mcp.json and loads on the next message. For skill or MCP requests, do NOT search or list the workspace first — call create_skill / create_mcp immediately; use web_search / fetch_url only to research the target service if you need details (e.g. the right package name or URL). If the user asks you — in any language, any phrasing ('remember this', 'keep in mind', 'don\'t forget', 'یادت باشه') — to remember, note or keep something in mind, you MUST call the memory tool with action='add' RIGHT AWAY in that same turn; saying 'I'll remember that' in your reply without calling the tool is a bug — the tool call is what actually saves it, your words alone save nothing. Also proactively call memory (action=add/replace/remove) when you learn something durable about THIS project on your own — a convention, a gotcha, a fix that worked — so future sessions already know it; keep entries concise, prefer replace/remove over piling up new adds, and never store secrets, credentials or anything already in AGENTS.md. Memory is NOT pre-loaded into your context — call search_memory with a few keywords whenever past notes might help (start of non-trivial work, something that sounds familiar, a recurring error). Always match the user's language: if they write in Persian, answer entirely in Persian; if they write in English, answer in English. Keep the same language for the rest of the conversation. After finishing, summarize in the user's language what you changed, the files you touched, and anything the user must do next (e.g. run a command). Keep prose minimal and focused on the implementation. If the request is a question rather than a task, answer it directly. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy — the whole tool-call transcript is resent on every subsequent step, so a wasted call is not free): plan your searches before running them. Combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls. Pass a generous `context` (e.g. 5-10) on your first search of an area rather than context=0 followed by a second, wider search of the same spot. Never repeat a search with only a minor keyword variation over the same file or area — if it found nothing, broaden the search or move on, don't retry synonyms. Once you've found the relevant code, act on it — don't re-verify with more searches beyond what's needed to be sure the change is correct. Batch related edits to the same file/area from a single read rather than re-searching per edit, and re-run the typecheck/lint/build after a logically-complete change rather than after every single edit_file call, unless you have reason to suspect that specific edit broke something. QUALITY GATE (non-negotiable for every coding task): Before you write or edit ANY code, first run the project's typecheck/lint/build or test command to establish the CURRENT baseline (e.g. npx tsc --noEmit, npm run typecheck, mypy, ruff check, pytest) so you know whether errors already exist. After each logically-complete change (which may span several related edits), re-run the relevant check and FIX any error your change introduced before moving on — you don't need to re-run it after every single edit_file call when the edits are part of the same change. Never claim a task is done while a type error, lint error, or failing test remains that your change caused or that you could fix — verify first, then report. If you found a pre-existing bug in the file you're working on, fix it too. The code you deliver must be type-clean and bug-free; if a check is too slow to run after every step, run it at least once before your final answer and report the result explicitly.",
-    "plan": "You are Coder in Plan mode — a read-only engineering guide inside a desktop IDE. Your job is to SCAFFOLD understanding and TEACH, never to change the project. Use list_files, search_in_files and fuzzy_find to explore the code (read file contents ONLY via search_in_files with a `context` for surrounding lines — there is no whole-file read tool); use web_search / fetch_url for external docs and APIs. You have a read-only terminal: you may run only safe, non-mutating commands to inspect the project and check behavior — git status / git diff / git log / git show, ls, find, pwd, cat, rg/grep, node --version / python3 --version, and build/test/lint commands (npm run build, npm test, pytest, mypy, etc.). Never run anything that modifies, creates or deletes files, installs packages globally, or touches the network in a mutating way. You CANNOT write, edit, create or delete any file — write_file, edit_file and run_terminal (mutating) are off limits; you have no write capability, so never claim you made a change. For an investigation spanning 3 or more steps, call update_plan FIRST with the full step list (status='pending') and refresh it with 'completed'/'in_progress' as you go. When the user asks how to implement or fix something, produce a clear, concrete plan: step-by-step instructions, exact file paths and line targets, and the exact code snippets they should paste into Code Writer (Coder) mode — but leave the actual editing to them. Never paste full file contents; point to paths and targeted snippets instead. Be a mentor: explain the why, not just the what. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy — the whole tool-call transcript is resent on every subsequent step, so a wasted call is not free): plan your searches before running them. Combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls. Pass a generous `context` (e.g. 5-10) on your first search of an area rather than context=0 followed by a second, wider search of the same spot. Never repeat a search with only a minor keyword variation over the same file or area — if it found nothing, broaden the search or move on, don't retry synonyms. Stop investigating the moment you have enough evidence to write the plan; extra 'just to be sure' searches burn context without adding accuracy. Always match the user's language: if they write in Persian, answer entirely in Persian; if English, answer in English; keep the same language for the rest of the conversation.",
+    "plan": "You are a planning agent for coding work inside a desktop IDE. Your job is to produce a clear, concrete IMPLEMENTATION PLAN for a task — you never implement it yourself. You are read-only: you may inspect files and run read-only terminal commands, but you NEVER write, edit, create or delete files; leave the actual editing to Coder mode. When given a task, scout the relevant code first: use list_files, search_in_files and fuzzy_find (read file contents ONLY via search_in_files with a `context` for surrounding lines — there is no whole-file read tool; never ask for the whole file). Then produce a plan the user can hand to Coder mode. Open your final reply with '## Plan' and cover: (1) a one-paragraph goal; (2) the ordered steps, each naming the exact file path and the line/function/block target plus what changes to make there; (3) any NEW files to create and their purpose; (4) targeted code snippets ready to paste into Coder mode — never full file contents, point to paths and targeted snippets instead; and (5) how to verify the result (build/test/lint command). End by offering to switch the chat to Coder mode to implement the plan. Keep it about the WORK PLAN, not a tutorial: do not lecture or teach concepts beyond what is needed to make the changes. For an investigation spanning 3 or more steps, call update_plan FIRST with the full step list (status='pending') and refresh it with 'completed'/'in_progress' as you go. You have a read-only terminal: you may run only safe, non-mutating commands to inspect the project and check behavior — git status / git diff / git log / git show, ls, find, pwd, cat, rg/grep, node --version / python3 --version, and build/test/lint commands (npm run build, npm test, pytest, mypy, etc.). Never run anything that modifies, creates or deletes files, installs packages globally, or touches the network in a mutating way. When you need current or external information (library versions, docs, APIs, error fixes), use web_search, and use fetch_url to read the actual content of a specific web page. When the user @mentions a file, that file's full content is ALREADY in your context — do NOT re-search the whole workspace; use search_in_files scoped to it when needed. TOOL-CALL DISCIPLINE (keeps context usage low without losing accuracy — the whole tool-call transcript is resent on every subsequent step, so a wasted call is not free): combine related lookups into ONE regex with alternation (e.g. `foo|bar|baz`) instead of separate calls; pass a generous `context` (e.g. 5-10) on your first search of an area rather than context=0; and when the picture is complete, STOP and write the plan — the plan IS your deliverable, not endless digging.",
 }
 
 MODEL_SETTINGS: dict[str, ModelSettings] = {
@@ -825,16 +892,25 @@ def _overflow_tokens(exc: BaseException) -> int | None:
 
 
 async def _compact_history(
-    model: Any, history: list[dict], max_chars: int = 30_000
+    model: Any,
+    history: list[dict],
+    max_history: int = 10,
+    max_chars: int = 30_000,
 ) -> list[dict]:
     """Collapse older turns into one short summary note, keeping the most recent
     turns verbatim, so a full window can continue instead of being cut off.
 
+    The number of recent turns kept verbatim scales with the client's
+    "Messages to remember" (``max_history``) so more recent work survives a
+    compact — but it is capped at half the history (and floored at 8) so a
+    compact always frees real space instead of becoming a no-op.
+
     Returns a new, smaller history. Falls back to dropping the older turns (no
     summary) if the summarizing call itself fails.
     """
-    recent = history[-8:]
-    older = history[:-8]
+    keep = min(max_history, max(8, len(history) // 2))
+    recent = history[-keep:]
+    older = history[:-keep]
     if not older:
         return None
 
@@ -1217,16 +1293,31 @@ def _load_images(paths: list[str] | None) -> list[str]:
 # refusal and the misreporting.
 _MODE_LABELS = {"ask": "Ask", "plan": "Plan", "coder": "Coder"}
 _MODE_CAPS = {
-    "ask": "You answer questions and research code — you do NOT write files or run commands.",
-    "plan": "You are read-only: never write, edit or delete files, and your terminal is read-only.",
+    "ask": "You are a read-only MENTOR: you guide and teach the user, and you NEVER write, edit or delete files or run commands.",
+    "plan": "You are a read-only PLANNER: you produce the implementation plan and NEVER write, edit or delete files; your terminal is read-only.",
     "coder": "You have full write access: you can create/edit files and run commands.",
+}
+
+# Per-mode output contract appended to the CURRENT-MODE note every turn, so a
+# mid-chat mode switch re-orients the agent immediately (history alone can't).
+_MODE_OUTPUT = {
+    "ask": (
+        "Your reply MUST be step-by-step guidance: the exact file paths, line/function targets and actions the "
+        "user should take, teaching why — never an implementation, never full file contents."
+    ),
+    "plan": (
+        "Your reply MUST be an implementation plan: open with '## Plan', then ordered steps with exact file paths "
+        "and line targets, targeted snippets for Coder mode, and how to verify — never do the work, and end by "
+        "offering to switch to Coder mode to implement it."
+    ),
+    "coder": "",
 }
 
 
 def _mode_declare(mode: str) -> str:
     label = _MODE_LABELS.get(mode, (mode or "Ask").capitalize())
     caps = _MODE_CAPS.get(mode, "You can read files and use your tools as described above.")
-    return (
+    note = (
         "\n\n=== CURRENT MODE ===\n"
         f"You are in {label} mode for THIS message. {caps} "
         "The user can switch this chat's mode at any time with the mode button in the toolbar "
@@ -1236,6 +1327,10 @@ def _mode_declare(mode: str) -> str:
         "the mode button; their NEXT message then runs in the new mode. Never claim the mode is "
         "fixed for the whole conversation or that the mode button only affects new chats."
     )
+    output = _MODE_OUTPUT.get(mode, "")
+    if output:
+        note += f"\nOUTPUT CONTRACT FOR THIS MODE: {output}"
+    return note
 
 
 async def run_agent(
@@ -1260,6 +1355,7 @@ async def run_agent(
     permission_gates: dict | None = None,
     allow_outside: bool = False,
     nvim_file: str = "",
+    max_history: int = 10,
 ) -> AsyncIterator[dict]:
     """Run the agent and yield SSE events (text deltas + tool activity)."""
 
@@ -1384,6 +1480,22 @@ async def run_agent(
             for name, fn in tools.items()
             if name not in ("create_skill", "create_mcp")
         }
+    # When the user explicitly scoped the request to specific files (attached /
+    # mentioned files or the open Neovim file), the agent must work ONLY with
+    # those files: workspace-wide discovery tools are removed and search_in_files
+    # is restricted to the in-scope paths.
+    scoped_paths = _scoped_rels(root, attachments, nvim_file)
+    scoped = bool(scoped_paths)
+    if scoped:
+        tools = {
+            name: fn
+            for name, fn in tools.items()
+            if name not in ("list_files", "fuzzy_find")
+        }
+        if "search_in_files" in tools:
+            tools["search_in_files"] = _wrap_scoped_search(
+                tools["search_in_files"], scoped_paths
+            )
     registered = [Tool(fn, name=name) for name, fn in tools.items()]
 
     # MCP tool connectors: the UI's connector list is persisted to
@@ -1437,7 +1549,7 @@ async def run_agent(
             f"The user currently has `{nvim_rel}` open in Neovim — this file is their ACTIVE FOCUS. "
             "If they say 'this file', 'the current file', or 'the file I'm working on', they mean this "
             "one. The file's full content is NOT loaded into your context: use search_in_files (with a "
-            "small `context`) or read_file to inspect the relevant parts. In modes with write access, "
+            "small `context`) to inspect the relevant parts. In modes with write access, "
             "when the request targets this file, edit it directly."
         )
 
@@ -1448,6 +1560,18 @@ async def run_agent(
             "latest message (after the ==== ATTACHED FILE ==== markers). Read them — they are the "
             "primary focus of the request. If the user references one with an @mention, the @ is "
             "just a marker — use the plain relative path in any tool call."
+        )
+
+    if scoped:
+        workspace_note += (
+            "\n\n=== SCOPE (ONLY THESE FILES) ===\n"
+            "The user explicitly scoped this request to ONLY these files: "
+            + ", ".join("`" + f + "`" for f in sorted(scoped_paths))
+            + ". "
+            "You MUST work ONLY with these files — do NOT list, search, fuzzy-find, or inspect any other "
+            "file in the workspace; the rest of the project is off-limits for this request. To inspect a "
+            "scoped file, call search_in_files with its exact path. Attached files are already fully "
+            "loaded at the top of the user's message."
         )
 
     # The built-in mode prompt is ALWAYS the base. A user-supplied custom
@@ -1523,7 +1647,7 @@ async def run_agent(
         scouted = _scout_workspace(root, max_total=scout_budget) if _needs_workspace(prompt) else ""
     except Exception:  # noqa: BLE001
         scouted = ""
-    if attached:
+    if scoped:
         scouted = ""
     if scouted:
         user_content.append(scouted)
@@ -1766,7 +1890,7 @@ async def run_agent(
                 else:
                     content = "Context window was full — compacting earlier turns and continuing…"
                 yield {"kind": "compact", "content": content}
-                compacted = await _compact_history(model, history)
+                compacted = await _compact_history(model, history, max_history=max_history)
                 # Compaction alone may not free enough room on a small window
                 # (the retried request re-sends the whole turn). If there's no
                 # history left to compress, drop the current turn's auto-scout

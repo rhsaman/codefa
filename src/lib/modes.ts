@@ -8,14 +8,14 @@ export const BUILTIN_MODES: AgentModeDef[] = [
     id: 'ask',
     label: 'Ask',
     icon: 'chat',
-    description: 'General purpose questions and research. Reads files and the web, never modifies anything.',
+    description: 'Mentor mode: answers your questions and teaches you step by step — which file, which line, what to change. Read-only, never modifies anything.',
     capabilities: { readFiles: true, writeFiles: false, runTerminal: false, web: true },
   },
   {
     id: 'plan',
     label: 'Plan',
     icon: 'list',
-    description: 'Scout, guide and teach code. Read-only files and terminal, never writes.',
+    description: 'Plans the work: scouts the code and lays out concrete steps and changes for Coder mode. Read-only files and terminal, never writes.',
     capabilities: { readFiles: true, writeFiles: false, runTerminal: true, web: true },
   },
   {

@@ -77,6 +77,8 @@ export interface StreamParams {
   mode: AgentMode
   prompt: string
   history: Array<{ role: string; content: string }>
+  /** How many recent messages to send per turn / preserve verbatim on compact. */
+  maxHistory?: number
   attachments?: string[]
   images?: string[]
   systemPrompt?: string
@@ -116,6 +118,7 @@ export async function streamChat(
       mode: params.mode,
       prompt: params.prompt,
       history: params.history,
+      max_history: params.maxHistory ?? params.provider.maxHistory ?? 10,
       attachments: params.attachments ?? [],
       images: params.images ?? [],
       system_prompt: params.systemPrompt ?? '',

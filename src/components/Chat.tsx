@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { getActiveProvider, useStore, DEFAULT_MAX_HISTORY } from "../lib/store";
 import { streamChat, fetchModels, transcribeAudio, respondPermission } from "../lib/api";
 import { api, workspaceSkills, type WorkspaceSkill } from "../lib/fs";
@@ -120,6 +121,12 @@ export function ChatPanel() {
   const [stalled, setStalled] = useState(false);
   const [skillOpen, setSkillOpen] = useState(false);
   const [liveUsage, setLiveUsage] = useState<number | null>(null);
+  const [titlebarEl, setTitlebarEl] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    // The titlebar mounts in the same commit as this panel, so resolve the
+    // portal target only after the DOM is actually committed.
+    setTitlebarEl(document.getElementById("titlebar-toolbar"));
+  }, []);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -527,6 +534,7 @@ const contextUsed = useMemo(() => {
           mode: chat.mode,
           prompt: finalPrompt,
           history,
+          maxHistory,
           attachments: atts.map((a) => `${rootDir}/${a.replace(/^\/+/, "")}`),
           images: imgs.map((i) => i.path),
           systemPrompt: s.settings.systemPrompts?.[chat.mode] ?? "",
@@ -558,7 +566,6 @@ const contextUsed = useMemo(() => {
       setStalled(false);
       setBusy(false);
       abortRef.current = null;
-      setNvimMentioned(false);
       useStore.getState().setStreaming(false, false);
       useStore.getState().updateMessage(assistantMsg.id, { streaming: false });
     }
@@ -592,9 +599,10 @@ const contextUsed = useMemo(() => {
           mode: ch.mode,
           prompt,
           history: [],
+          maxHistory,
           systemPrompt: s.settings.systemPrompts?.[ch.mode] ?? "",
           cap: getMode(s.settings, ch.mode).capabilities,
-          mcpServers: s.settings.mcpServers ?? {},
+          mcpServers: {},
         },
         (ev) => {
           if (ev.kind === "text") summary += ev.content ?? "";
@@ -610,6 +618,7 @@ const contextUsed = useMemo(() => {
     s.compactChat(
       ch.id,
       `[Compacted conversation]\n${summary.trim() || "(empty summary)"}`,
+      maxHistory,
     );
   };
 
@@ -1010,7 +1019,9 @@ const contextUsed = useMemo(() => {
 
   return (
     <div className="chat-panel">
-      <div className="chat-toolbar">
+      {titlebarEl &&
+        createPortal(
+        <div className="chat-toolbar titlebar-toolbar">
         <button
           className="dir-toggle"
           onClick={toggleDir}
@@ -1040,36 +1051,9 @@ const contextUsed = useMemo(() => {
           {formatTokens(contextUsed)}
           {ctxPct !== null ? ` (${ctxPct}%)` : ""}
         </span>
-        <span
-          style={{
-            marginLeft: "auto",
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-          }}
-        >
-          <ModeSelect
-            modes={modes}
-            value={chat.mode}
-            onChange={changeMode}
-          />
-          <span
-            className={`status-dot ${sidecarStatus}`}
-            title={
-              sidecarStatus === "ok"
-                ? "Agent ready"
-                : "Agent not ready (npm run setup)"
-            }
-          />
-          <button
-            className="btn secondary"
-            style={{ padding: "4px 10px", fontSize: 12 }}
-            onClick={() => useStore.getState().newChat(chat.mode)}
-          >
-            + New chat
-          </button>
-        </span>
-      </div>
+        </div>,
+        titlebarEl,
+        )}
 
       <div className="chat-scroll" ref={scrollRef} onScroll={onChatScroll}>
         <div className="chat-messages" data-dir={dir}>

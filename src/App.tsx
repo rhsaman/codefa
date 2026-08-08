@@ -97,6 +97,7 @@ export default function App() {
           </svg>
         </button>
         <span className="app-title">CODEFA</span>
+        <div id="titlebar-toolbar" />
         <button
           className="workspace-btn"
           title={activeChatRoot || 'No workspace open — pick a folder for this chat'}
