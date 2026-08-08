@@ -66,6 +66,10 @@ class ChatRequest(BaseModel):
     # the user disabled it). Resolved against the workspace root; ignored if it
     # escapes the root or the auto-mention is off.
     nvim_file: str = ""
+    # LSP diagnostics Neovim reported for the open file (array of dicts with
+    # lnum/col/severity/source/code/message). Summarized into the agent's
+    # context so it can see what's wrong in the active file.
+    nvim_diagnostics: list[dict] = []
     # Recent-message budget from the client ("Messages to remember"). The
     # backend uses it to decide how many recent turns to keep verbatim when it
     # auto-compacts an overflowing context, so recent work is never lost.
@@ -195,7 +199,19 @@ def _friendly_error(exc: Exception, model: str) -> str:
     if detail:
         text = detail
     low = text.lower()
-    if "output retries" in low or "return text or call a tool" in low or "unexpectedmodelbehavior" in low:
+    if (
+        "incomplete chunked read" in low
+        or "peer closed connection" in low
+        or "connection was closed" in low
+        or "remote protocol error" in low
+        or "connection dropped" in low
+    ):
+        text += (
+            "\n\nThe connection to the model was dropped mid-stream (the upstream closed the "
+            "request while streaming a reply). This is usually transient — retry the same "
+            "message, or switch to another model in Settings if it keeps happening."
+        )
+    elif "output retries" in low or "return text or call a tool" in low or "unexpectedmodelbehavior" in low:
         text += (
             "\n\nThe model returned no usable reply (empty or invalid response). This model/provider"
             " is unreliable for this turn — switch model in Settings and retry."
@@ -303,6 +319,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 permission_gates=PERMISSION_GATES,
                 allow_outside=req.allow_outside,
                 nvim_file=req.nvim_file,
+                nvim_diagnostics=req.nvim_diagnostics,
                 max_history=req.max_history,
             ):
                 # --- بخش اصلاح شده برای جلوگیری از خطای AttributeError ---

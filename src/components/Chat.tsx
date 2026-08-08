@@ -10,7 +10,7 @@ import {
 } from "../lib/context";
 import { supportsReasoning } from "../lib/thinking";
 import { allModes, getMode } from "../lib/modes";
-import type { AgentMode, ChatMessage, SidecarEvent, ToolActivity } from "../types";
+import type { AgentMode, ChatMessage, NvimDiagnostic, SidecarEvent, ToolActivity } from "../types";
 import { ChatMessageView } from "./ChatMessage";
 import { ModeSelect } from "./ModeSelect";
 
@@ -59,16 +59,21 @@ function sliceToBudget(
   history: Array<{ role: string; content: string }>,
   maxHistory: number,
   contextWindow?: number,
+  mode?: AgentMode,
 ): Array<{ role: string; content: string }> {
   // Model-scale the history char budget so small-context models (8k) get a tiny
   // slice, mirroring the backend's own trimmer.
   const ctx = contextWindow && contextWindow > 0 ? contextWindow : 32000;
   const budget = Math.floor(ctx * 1.5); // chars (~37% of window at 4 chars/token); mirrors the backend's conservative history share
-  const capped = history.slice(-maxHistory);
+  // Ask (mentor) replies are guidance, not a scrollback the model must re-read
+  // verbatim, so trim its historical tail harder (~60k chars ≈ 15k tokens),
+  // matching the backend's own Ask cap. Keeps the recent turns fully intact.
+  const capped = mode === "ask" ? Math.min(budget, 60000) : budget;
+  const recent = history.slice(-maxHistory);
   const kept: typeof history = [];
   let acc = 0;
-  for (const m of [...capped].reverse()) {
-    if (kept.length > 0 && acc + m.content.length > budget) break;
+  for (const m of [...recent].reverse()) {
+    if (kept.length > 0 && acc + m.content.length > capped) break;
     kept.push(m);
     acc += m.content.length;
   }
@@ -91,6 +96,18 @@ export function ChatPanel() {
   const modes = useStore((s) => allModes(s.settings));
   const maxHistory = provider.maxHistory ?? DEFAULT_MAX_HISTORY;
   const nvimFile = useStore((s) => s.nvimFile);
+  const nvimDiags = useStore((s) => s.nvimDiagnostics);
+  const nvimDiagCounts = useMemo(() => {
+    const counts = { error: 0, warning: 0, info: 0, hint: 0 };
+    for (const d of nvimDiags) {
+      const sev = d.severity;
+      if (sev === 1 || sev === "Error" || sev === "error") counts.error++;
+      else if (sev === 2 || sev === "Warning" || sev === "warning") counts.warning++;
+      else if (sev === 3 || sev === "Information" || sev === "information") counts.info++;
+      else counts.hint++;
+    }
+    return counts;
+  }, [nvimDiags]);
 
   const wroot = chat?.root || root;
   const nvimRel = useMemo(() => {
@@ -148,6 +165,7 @@ export function ChatPanel() {
   const abortRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastEventAt = useRef(0);
+  const toggleRecordingRef = useRef<() => void>(() => {});
   /** Whether the open Neovim file is selected to be mentioned on the next send. */
   const [nvimMentioned, setNvimMentioned] = useState(false);
   /** Transient confirmation shown when the user switches the chat's mode. */
@@ -182,12 +200,16 @@ export function ChatPanel() {
     let cancelled = false;
     window.coder
       .getNvimFile()
-      .then((abs) => {
-        if (!cancelled) useStore.getState().setNvimFile(abs);
+      .then((f) => {
+        if (cancelled) return;
+        useStore.getState().setNvimFile(f.abs);
+        useStore.getState().setNvimDiagnostics((f.diagnostics ?? []) as NvimDiagnostic[]);
       })
       .catch(() => undefined);
     const unsub = window.coder.onNvimFile((f) => {
-      if (!cancelled) useStore.getState().setNvimFile(f.abs);
+      if (cancelled) return;
+      useStore.getState().setNvimFile(f.abs);
+      useStore.getState().setNvimDiagnostics((f.diagnostics ?? []) as NvimDiagnostic[]);
     });
     return () => {
       cancelled = true;
@@ -277,10 +299,15 @@ export function ChatPanel() {
       setAttachments((a) => (a.includes(rel) ? a : [...a, rel]));
       requestAnimationFrame(() => textareaRef.current?.focus());
     };
+    const onToggleVoice = () => {
+      toggleRecordingRef.current();
+    };
     window.addEventListener("coder:toggle-mode", onToggleMode);
+    window.addEventListener("coder:toggle-voice", onToggleVoice);
     window.addEventListener("coder:attach-file", onAttachFile as EventListener);
     return () => {
       window.removeEventListener("coder:toggle-mode", onToggleMode);
+      window.removeEventListener("coder:toggle-voice", onToggleVoice);
       window.removeEventListener("coder:attach-file", onAttachFile as EventListener);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -398,7 +425,7 @@ const contextUsed = useMemo(() => {
           (m.role === "user" || m.role === "assistant" || m.role === "system"),
       )
       .map((m) => ({ role: m.role, content: m.content }));
-    const history = sliceToBudget(allHistory, maxHistory, ctxWindow ?? undefined);
+    const history = sliceToBudget(allHistory, maxHistory, ctxWindow ?? undefined, chat.mode);
 
     const abort = new AbortController();
     abortRef.current = abort;
@@ -553,6 +580,7 @@ const contextUsed = useMemo(() => {
           cap: getMode(s.settings, chat.mode).capabilities,
           allowOutside: s.outsideAllowed,
           nvimFile: nvimMentioned ? nvimRel || undefined : undefined,
+          nvimDiagnostics: nvimMentioned ? nvimDiags : undefined,
           signal: abort.signal,
         },
         handleEvent,
@@ -591,18 +619,26 @@ const contextUsed = useMemo(() => {
       "under 150 words, no preamble.\n\n" +
       transcript;
     let summary = "";
+    // Run the summarizer as a minimal READ-ONLY request: no tools (every cap
+    // false), no MCP servers, no skills, and the "ask" base prompt. This stops
+    // the summarizer from being hijacked into tool loops or plan output, which
+    // made /compact hang or return non-summary text in coder/plan mode.
+    const ctr = new AbortController();
+    const timeout = setTimeout(() => ctr.abort(), 60_000);
     try {
       await streamChat(
         {
           provider: getActiveProvider(),
           root: rootDir,
-          mode: ch.mode,
+          mode: "ask",
           prompt,
           history: [],
-          maxHistory,
-          systemPrompt: s.settings.systemPrompts?.[ch.mode] ?? "",
-          cap: getMode(s.settings, ch.mode).capabilities,
+          maxHistory: 0,
+          systemPrompt: "",
+          cap: { readFiles: false, writeFiles: false, runTerminal: false, web: false },
           mcpServers: {},
+          skills: [],
+          signal: ctr.signal,
         },
         (ev) => {
           if (ev.kind === "text") summary += ev.content ?? "";
@@ -611,8 +647,13 @@ const contextUsed = useMemo(() => {
         },
       );
     } catch (err) {
-      summary = `(compact failed: ${(err as Error).message})`;
+      if ((err as Error).name === "AbortError") {
+        summary = "(compact failed: timed out after 60s)";
+      } else {
+        summary = `(compact failed: ${(err as Error).message})`;
+      }
     } finally {
+      clearTimeout(timeout);
       setBusy(false);
     }
     s.compactChat(
@@ -872,6 +913,7 @@ const contextUsed = useMemo(() => {
       void startRecording();
     }
   };
+  toggleRecordingRef.current = toggleRecording;
 
   const startCmd = (at?: number) => {
     const el = textareaRef.current;
@@ -1211,6 +1253,25 @@ const contextUsed = useMemo(() => {
             >
               <span className="nvim-glyph">nvim</span>
               <span className="nvim-file">{nvimLabel}</span>
+              {nvimDiagCounts.error + nvimDiagCounts.warning + nvimDiagCounts.info + nvimDiagCounts.hint > 0 && (
+                <span className="nvim-lsp" dir="ltr">
+                  {nvimDiagCounts.error > 0 && (
+                    <span className="lsp-count lsp-error" title="LSP errors">
+                      {nvimDiagCounts.error}✕
+                    </span>
+                  )}
+                  {nvimDiagCounts.warning > 0 && (
+                    <span className="lsp-count lsp-warning" title="LSP warnings">
+                      {nvimDiagCounts.warning}!
+                    </span>
+                  )}
+                  {nvimDiagCounts.info + nvimDiagCounts.hint > 0 && (
+                    <span className="lsp-count lsp-info" title="LSP info/hints">
+                      {nvimDiagCounts.info + nvimDiagCounts.hint}·
+                    </span>
+                  )}
+                </span>
+              )}
               <span className="nvim-check">{nvimMentioned ? "✓" : "+"}</span>
             </button>
           )}
@@ -1288,8 +1349,8 @@ const contextUsed = useMemo(() => {
                   transcribing
                     ? "Transcribing voice…"
                     : recording
-                      ? "Stop recording"
-                      : "Record voice input"
+                      ? "Stop recording (⌘⇧M)"
+                      : "Record voice input (⌘⇧M)"
                 }
               >
                 {recording ? (

@@ -3291,6 +3291,37 @@ textarea {
   line-height: 1;
 }
 
+.nvim-lsp {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 2px;
+}
+
+.nvim-lsp .lsp-count {
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.nvim-lsp .lsp-error {
+  color: #ff6b6b;
+  background: color-mix(in srgb, #ff6b6b 16%, transparent);
+}
+
+.nvim-lsp .lsp-warning {
+  color: #ffd166;
+  background: color-mix(in srgb, #ffd166 16%, transparent);
+}
+
+.nvim-lsp .lsp-info {
+  color: #74c0fc;
+  background: color-mix(in srgb, #74c0fc 16%, transparent);
+}
+
 /* ---- mode switch confirmation banner ---- */
 .mode-notice {
   margin: 0 0 8px;

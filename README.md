@@ -68,9 +68,10 @@ llama.cpp — بیشترِ کارها بر بستر و داده‌های خود�
   and local Ollama — all driven through Pydantic AI.
 - **Dynamic model switching** — models are fetched from the active provider and
   selectable directly from the UI settings.
-- **Two agent modes** — `Chat` (conversational coding assistant) and
-  `Code Writer` (autonomous code-writing agent). Toggle at the top of the chat
-  panel or with `Cmd/Ctrl+M`.
+- **Three agent modes** — `Ask` (read-only mentor that teaches you step by step),
+  `Plan` (read-only planner that scouts the code and writes an implementation
+  plan) and `Coder` (autonomous code-writing agent). Cycle through them at the
+  top of the chat panel or with `Cmd/Ctrl+M`.
 - **Tool-based agent** — `search_in_files`, `list_files`, `write_file`,
   `edit_file`, plus MCP connectors, all executed by the Pydantic AI sidecar
   and constrained to the project root.
@@ -93,7 +94,10 @@ llama.cpp — بیشترِ کارها بر بستر و داده‌های خود�
 - **RTL / LTR** — chat messages use `direction: auto; unicode-bidi: plaintext` so
   Persian and English mix correctly; the whole README and UI support both.
 - **Streaming** — token-by-token SSE streaming from the sidecar, no terminal output.
-- **Persistence** — provider config and chat history stored in `~/.coder/`.
+- **Persistence** — provider config, chat history, skills, MCP connectors and
+  saved plans all stored in `~/.coder/` — never inside your project.
+- **Slash commands** — `/compact` (summarizes the conversation into a running
+  summary), `/clear`, `/new`, `/undo`, `/redo`, `/help`, `/skill` and `/mcp`.
 - **Bonus** — model caching, multiple chats, dark/light theme, keyboard shortcuts.
 
 ### Requirements
@@ -146,17 +150,18 @@ Output lands in `release/`.
    (`opencode/deepseek-v4-flash-free` via OpenRouter). You can switch to
    OpenRouter, a custom OpenAI-compatible API, or a local endpoint
    (Ollama / llama.cpp / vLLM), enter your API key / base URL, and pick a model.
-3. Choose an agent mode: **Chat** or **Code Writer**.
+3. Choose an agent mode: **Ask**, **Plan** or **Coder**.
 4. Type a message and press `Cmd/Ctrl+Enter`. The agent streams its reply and
    uses sandboxed tools to inspect or modify files. Press the mic button to
-   dictate instead of typing.
+   dictate instead of typing. In Plan mode, `/compact` saves a running summary,
+   and the final plan is stored under `~/.coder/plans/<workspace>/`.
 
 ### Keyboard shortcuts
 
 | Shortcut         | Action                                             |
 | ---------------- | -------------------------------------------------- |
 | `Cmd/Ctrl+Enter` | Send chat message                                  |
-| `Cmd/Ctrl+M`     | Toggle agent mode (Chat / Code Writer)             |
+| `Cmd/Ctrl+M`     | Cycle agent mode (Ask / Plan / Coder)             |
 | `Cmd/Ctrl+P`     | Quick-open / search overlay (⌘⇧F for content grep) |
 | `Cmd/Ctrl+B`     | Toggle sidebar                                     |
 | `Cmd/Ctrl+,`     | Open settings                                      |
@@ -180,7 +185,7 @@ Output lands in `release/`.
 │               /transcribe (Whisper)      │
 │ providers.py  → pydantic-ai OpenAIModel  │
 │ tools.py      sandboxed fs tools         │
-│ agents.py     Chat / Code Writer agents  │
+│ agents.py     Ask / Plan / Coder agents   │
 │               (live usage + compact)     │
 └───────────────────────────────────────────┘
 ```
@@ -208,9 +213,10 @@ Pydantic AI ساخته شده و می‌تواند مستقیماً با کد ش
   Pydantic AI.
 - **تعویض سادهٔ مدل** — فهرست مدل‌ها از فراهم‌کنندهٔ فعال دریافت می‌شود و
   می‌توانید از همان صفحهٔ تنظیمات، مدل دلخواه را برگزینید.
-- **دو حالتِ عامل** — «گفتگو» (دستیار مکالمه‌ای کدنویسی) و «نویسندهٔ کد» (عامل
-  خودمختاری که مستقلاً کد می‌نویسد). با دکمهٔ بالای پنل گفتگو یا کلید `Cmd/Ctrl+M`
-  می‌توانید میانشان جابه‌جا شوید.
+- **سه حالتِ عامل** — «پرسش» (دستیارِ فقط‌خواندنی که گام‌به‌گام به شما آموزش
+  می‌دهد)، «برنامه» (برنامه‌ریزِ فقط‌خواندنی که کد را می‌کاود و یک برنامهٔ پیاده‌سازی
+  می‌نویسد) و «نویسندهٔ کد» (عامل خودمختاری که مستقلاً کد می‌نویسد). با دکمهٔ بالای
+  پنل گفتگو یا کلید `Cmd/Ctrl+M` می‌توانید میانشان جابه‌جا شوید.
 - **عاملِ ابزارمحور** — عملیات‌هایی مانند `search_in_files`، `write_file`،
   `list_files` و `edit_file` (و همچنین اتصال‌های MCP) همگی توسط
   sidecar پایتونی اجرا و به ریشهٔ پروژه محدود می‌شوند.
@@ -234,8 +240,10 @@ Pydantic AI ساخته شده و می‌تواند مستقیماً با کد ش
   plaintext` استفاده می‌کنند تا ترکیب فارسی و انگلیسی به‌درستی نمایش داده شود.
 - **استریم** — پاسخ‌ها به‌شکل قطعه‌به‌قطعه و از طریق SSE از sidecar می‌رسند؛
   نیازی به نگه داشتن ترمینال نیست.
-- **ماندگاری** — پیکربندی فراهم‌کننده و تاریخچهٔ گفتگوها در `~/.coder/` ذخیره
-  می‌شوند.
+- **ماندگاری** — پیکربندی فراهم‌کننده، تاریخچهٔ گفتگوها، مهارت‌ها، اتصال‌های MCP و
+  برنامه‌های ذخیره‌شده همه در `~/.coder/` ذخیره می‌شوند و هرگز داخل پوشهٔ پروژهٔ شما.
+- **دستورهای اسلش** — `/compact` (خلاصه‌سازی گفتگو به یک خلاصهٔ جاری)، `/clear`،
+  `/new`، `/undo`، `/redo`، `/help`، `/skill` و `/mcp`.
 - **و چند چیز دیگر** — حافظهٔ پنهانِ مدل، چند گفتگوی موازی، تم تیره و روشن و
   میان‌برهای صفحه‌کلید.
 
@@ -291,18 +299,19 @@ npm run dist:linux  # فقط لینوکس
    OpenRouter، به یک APIِ سازگار با OpenAI یا به یک سرور محلی (Ollama /
    llama.cpp / vLLM) وصل شوید، کلید API و آدرس پایه (base URL) را وارد کنید و
    مدل را برگزینید.
-۳. حالتِ عامل را انتخاب کنید: **گفتگو** یا **نویسندهٔ کد**.
+۳. حالتِ عامل را انتخاب کنید: **پرسش**، **برنامه** یا **نویسندهٔ کد**.
 ۴. پیام خود را بنویسید و `Cmd/Ctrl+Enter` را بزنید. عامل پاسخ را به‌صورت
    زنده (استریم) نمایش می‌دهد و برای بررسی یا ویرایش فایل‌ها از ابزارهای
    sandbox شده بهره می‌گیرد. اگر دوست داشتید به جای تایپ، صحبت کنید، فقط
-   دکمهٔ میکروفون را فشار دهید.
+   دکمهٔ میکروفون را فشار دهید. در حالتِ برنامه، برنامهٔ نهایی در
+   `~/.coder/plans/<workspace>/` ذخیره می‌شود.
 
 ### میان‌برهای صفحه‌کلید
 
 | میان‌بر            | کارکرد                             |
 | ------------------ | ---------------------------------- |
 | `Cmd/Ctrl+Enter` | ارسال پیام گفتگو                   |
-| `Cmd/Ctrl+M`     | جابه‌جایی حالت عامل (گفتگو / نویسندهٔ کد) |
+| `Cmd/Ctrl+M`     | چرخش میان حالت‌های عامل (پرسش / برنامه / نویسندهٔ کد) |
 | `Cmd/Ctrl+P`     | جستجوی سریع و سریع‌باز کردن (⌘⇧F برای جستجوی محتوا) |
 | `Cmd/Ctrl+B`     | نمایش/پنهان‌کردن نوار کناری        |
 | `Cmd/Ctrl+,`     | باز کردن تنظیمات                   |
@@ -326,7 +335,7 @@ npm run dist:linux  # فقط لینوکس
 │                /transcribe (Whisper)                                │
 │ providers.py   → pydantic-ai OpenAIModel                            │
 │ tools.py       ابزارهای امنِ فایل (sandbox)                          │
-│ agents.py      عامل گفتگو / عامل نویسندهٔ کد                          │
+│ agents.py      عامل پرسش / برنامه / نویسندهٔ کد                        │
 │                (مصرف زندهٔ بافت + فشرده‌سازی)                         │
 └──────────────────────────────────────────────────────────────────────┘
 ```

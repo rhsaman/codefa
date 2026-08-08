@@ -67,6 +67,7 @@ _TERMINAL_BLOCK = [
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/?\*", "destructive rm is blocked"),
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+/?\s", "destructive rm is blocked"),
     (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*\s+~", "destructive rm on the home directory is blocked"),
+    (r"\bopen\b", "the macOS `open` launcher is blocked"),
     (r"dd\s+if=", "dd is blocked"),
     (r"(>|>>)\s*/dev/(sd|disk)", "raw disk access is blocked"),
     (r":\(\)\{", "fork bombs are blocked"),
@@ -283,6 +284,11 @@ def read_file(root: str, path: str) -> dict:
 def write_file(root: str, path: str, content: str) -> dict:
     """Write ``content`` to ``path`` (relative to root). Creates parent dirs."""
     target = resolve_safe(root, path)
+    if _is_workspace_coder_dir(root, target):
+        return {
+            "path": path,
+            "error": "the workspace .coder/ folder is reserved for the agent's own config (MCP servers, skills, plans) and lives in ~/.coder/ instead — do not write here",
+        }
     if os.path.isdir(target):
         return {"path": path, "error": "path is a directory"}
     try:
@@ -303,6 +309,17 @@ def user_coder_dir() -> str:
     base = os.path.join(os.path.expanduser("~"), ".coder")
     os.makedirs(base, exist_ok=True)
     return base
+
+
+def _is_workspace_coder_dir(root: str, target: str) -> bool:
+    """True if ``target`` resolves inside ``<root>/.coder``.
+
+    The workspace ``.coder/`` folder is reserved/forbidden: all agent config
+    (MCP servers, skills, plans) belongs in ``~/.coder``, never in the project.
+    """
+    root_real = os.path.realpath(os.path.abspath(root))
+    coder_dir = os.path.join(root_real, ".coder")
+    return target == coder_dir or target.startswith(coder_dir + os.sep)
 
 
 def slugify(name: str) -> str:
@@ -650,6 +667,11 @@ def edit_file(
     enough surrounding context to make the match unique).
     """
     target = resolve_safe(root, path)
+    if _is_workspace_coder_dir(root, target):
+        return {
+            "path": path,
+            "error": "the workspace .coder/ folder is reserved for the agent's own config (MCP servers, skills, plans) and lives in ~/.coder/ instead — do not write here",
+        }
     if not os.path.exists(target):
         return {"path": path, "error": "file not found"}
     if os.path.isdir(target):
@@ -1257,6 +1279,26 @@ def make_tool_callbacks(
         emit({"kind": "tool_result", "tool": "write_file", "summary": f"{len(content)} chars"})
         return f"Successfully wrote {len(content)} characters to {path}."
 
+    async def save_plan_tool(title: str, content: str) -> str:
+        """PLAN MODE ONLY. Save the implementation plan you just wrote to a markdown file at `~/.coder/plans/<workspace>/<date>-<slug>.md` (user-level, outside the project), so the user (or Coder mode, in a later turn) can open it again without you having to retype it. This is the ONE exception to plan mode being read-only — it never writes into the workspace, only into `~/.coder/plans/`. Call it ONCE, after your plan text is finalized in your reply, with `title` (a short name, becomes the filename slug) and `content` (the full plan in markdown — normally the same '## Plan' text you just wrote in your reply). Do not call this for anything other than the final plan for the current task."""
+        emit({"kind": "tool", "tool": "save_plan", "args": {"title": title}})
+        date_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        slug = slugify(title)
+        workspace_slug = slugify(os.path.basename(os.path.realpath(root).rstrip(os.sep))) or "workspace"
+        plans_dir = os.path.join(user_coder_dir(), "plans", workspace_slug)
+        rel_path = f"{date_prefix}-{slug}.md"
+        abs_path = os.path.join(plans_dir, rel_path)
+        try:
+            os.makedirs(plans_dir, exist_ok=True)
+            with open(abs_path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        except OSError as exc:
+            msg = f"could not write plan: {exc}"
+            emit({"kind": "tool_result", "tool": "save_plan", "summary": msg})
+            return f"ERROR saving plan to {abs_path}: {msg}"
+        emit({"kind": "tool_result", "tool": "save_plan", "summary": abs_path})
+        return f"Saved the plan to {abs_path}."
+
     async def memory_tool(action: str, subject: str, text: str = "") -> str:
         """Curate the project's durable memory (stored in MEMORY.md at the project root and loaded into every future session for this project). IMPORTANT: if the user explicitly asked you to remember/note/keep something in mind (any language, any phrasing), you MUST call this tool with action='add' in this same turn — replying with words like "I'll remember that" WITHOUT calling this tool saves nothing; the tool call itself is the save. action must be one of: 'add' (text= new note), 'replace' (subject= text to find, text= new wording for that bullet), 'remove' (subject= text contained in the bullet to delete). Beyond explicit requests, also remember durable, reusable facts you learn on your own: project conventions and how the project works, gotchas and bug fixes that worked, build/test quirks, and preferences the user stated. In ENGLISH. Do NOT store secrets, credentials, personal data, one-off details, or anything already in AGENTS.md. If memory is near its cap, prefer replace/remove over adding."""
         emit({"kind": "tool", "tool": "memory", "args": {"action": action, "subject": subject, "text": text}})
@@ -1844,6 +1886,8 @@ def make_tool_callbacks(
         "list_files": list_files_tool,
         "search_in_files": search_tool,
         "fuzzy_find": fuzzy_find_tool,
+        "explore": explore_tool,
+        "save_plan": save_plan_tool,
         "web_search": web_search_tool,
         "fetch_url": fetch_url_tool,
         "run_terminal": terminal_tool,

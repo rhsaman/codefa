@@ -9,6 +9,7 @@ yarn-error.log*
 *.tgz
 
 whisper
+MEMORY.md
 
 # ============================================================
 # Build output (renderer, main, packaged apps)

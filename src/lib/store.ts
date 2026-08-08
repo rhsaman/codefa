@@ -202,6 +202,9 @@ interface State {
   /** File open in Neovim (absolute path), fed by the main-process watcher. */
   nvimFile: string | null
   setNvimFile: (abs: string | null) => void
+  /** LSP diagnostics for the Neovim file, reported by nvim's language server. */
+  nvimDiagnostics: import('../types').NvimDiagnostic[]
+  setNvimDiagnostics: (diagnostics: import('../types').NvimDiagnostic[]) => void
 }
 
 function makeChat(mode: AgentMode = 'ask'): Chat {
@@ -255,6 +258,8 @@ export const useStore = create<State>((set, get) => ({
   outsideAllowed: false,
   /** Absolute path of the file currently open in Neovim (null if none / unknown). */
   nvimFile: null,
+  /** LSP diagnostics reported for the Neovim file (empty when none / unknown). */
+  nvimDiagnostics: [],
 
   load: async () => {
     const [settings, chats] = await Promise.all([
@@ -871,6 +876,7 @@ export const useStore = create<State>((set, get) => ({
   setOutsideAllowed: (allowed) => set({ outsideAllowed: allowed }),
 
   setNvimFile: (abs) => set({ nvimFile: abs }),
+  setNvimDiagnostics: (diagnostics) => set({ nvimDiagnostics: diagnostics }),
 }))
 
 export function getActiveChat(): Chat | null {

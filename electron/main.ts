@@ -29,6 +29,7 @@ let mainWindow: BrowserWindow | null = null
 // and push the path to the renderer so it can show the "open in Neovim" label.
 // Nothing is written to the user's config and no helper files are installed.
 let lastNvimAbs: string | null = null
+let lastNvimDiags: unknown[] = []
 let nvimPollTimer: ReturnType<typeof setInterval> | null = null
 
 /** Unix sockets listening for nvim RPC, found via `lsof` (matches any process
@@ -77,17 +78,67 @@ function queryNvimBuffer(socket: string): Promise<string | null> {
   })
 }
 
+/** Ask one nvim instance for the Language-Server diagnostics of its current
+ *  buffer (`vim.lsp.diagnostic.get(0)`), encoded as a compact JSON array.
+ *
+ *  `--remote-expr` with `luaeval('...')` only accepts a single Lua EXPRESSION,
+ *  so the whole body must be an immediately-invoked function expression
+ *  (`(function() ... end)()`) — plain multi-statement Lua (locals, `for`,
+ *  top-level `return`) makes nvim error with "unexpected symbol". The body runs
+ *  inside a pcall so a buffer without any LSP client (or an older nvim) resolves
+ *  to an empty array instead of erroring, and the JSON encoder falls back to
+ *  `vim.fn.json_encode` for nvim < 0.10 where `vim.json` does not exist.
+ *  Everything goes over the same `--server <socket> --remote-expr` channel the
+ *  buffer path uses, so no config/helper files are needed.
+ */
+function queryNvimDiagnostics(socket: string): Promise<unknown[]> {
+  return new Promise((resolve) => {
+    const body =
+      "function() local ok,res=pcall(function() " +
+      "local d=vim.lsp.diagnostic.get(0) or {} local a={} " +
+      "for _,x in ipairs(d) do a[#a+1]={lnum=x.lnum,col=x.col,end_lnum=x.end_lnum," +
+      "end_col=x.end_col,severity=x.severity,source=x.source,code=x.code,message=x.message} end " +
+      "local enc=vim.json and function(t) return vim.json.encode(t) end or function(t) return vim.fn.json_encode(t) end " +
+      "return enc(a) end) " +
+      "return ok and res or \"[]\" end"
+    execFile(
+      'nvim',
+      ['--server', socket, '--remote-expr', `luaeval('(${body})()')`],
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) return resolve([])
+        const raw = String(stdout ?? '').trim()
+        if (!raw) return resolve([])
+        try {
+          const parsed = JSON.parse(raw)
+          resolve(Array.isArray(parsed) ? parsed : [])
+        } catch {
+          resolve([])
+        }
+      },
+    )
+  })
+}
+
 async function pollNvimFile(): Promise<void> {
   const sockets = await findNvimSockets()
   let abs: string | null = null
+  let diags: unknown[] = []
   for (const sock of sockets.slice(0, 8)) {
     abs = await queryNvimBuffer(sock)
-    if (abs) break
+    if (abs) {
+      diags = await queryNvimDiagnostics(sock)
+      break
+    }
   }
-  if (abs === lastNvimAbs) return
+  const diagKey = JSON.stringify(diags)
+  const absChanged = abs !== lastNvimAbs
+  const diagChanged = diagKey !== JSON.stringify(lastNvimDiags)
+  if (!absChanged && !diagChanged) return
   lastNvimAbs = abs
+  lastNvimDiags = diags
   for (const win of BrowserWindow.getAllWindows()) {
-    win.webContents.send('nvim:file', { abs })
+    win.webContents.send('nvim:file', { abs, diagnostics: diags })
   }
 }
 
@@ -132,7 +183,7 @@ function registerIpc(): void {
   ipcMain.handle('sidecar:url', async () => getSidecarUrl())
 
   // --- neovim open-file state ----------------------------------------------
-  ipcMain.handle('nvim:get', () => lastNvimAbs)
+  ipcMain.handle('nvim:get', () => ({ abs: lastNvimAbs, diagnostics: lastNvimDiags }))
 
   // --- global environment (used for API keys / base URLs) -------------------
   // Any env var may be looked up so the Settings UI can check a user-specified

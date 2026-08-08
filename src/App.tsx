@@ -60,7 +60,12 @@ export default function App() {
         }
         case 'm': {
           e.preventDefault()
-          window.dispatchEvent(new CustomEvent('coder:toggle-mode'))
+          if (e.shiftKey) {
+            // ⌘⇧M: toggle voice recording (the mic button, see Chat.tsx).
+            window.dispatchEvent(new CustomEvent('coder:toggle-voice'))
+          } else {
+            window.dispatchEvent(new CustomEvent('coder:toggle-mode'))
+          }
           break
         }
         case 't': {

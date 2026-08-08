@@ -51,3 +51,11 @@
 - [2026-08-08] Fix implementation was blocked by a transient upstream Nvidia rate-limit error ("ResourceExhausted: Worker local total request limit reached"); retry later or switch models in Settings. The `send` function (lines 544-550) already filters to user-selected MCP chips; only `compactContext` needs the fix.
 - [2026-08-08] Bug: context compaction must pass `mcpServers: {}` (not `s.settings.mcpServers`) in `src/components/Chat.tsx` ~line 605; otherwise all configured MCP servers (e.g. Docker) load during auto-compact, causing `McpError: Connection closed` / "Docker Desktop is not running". Source already has the fix; if error persists, check for stale build.
 - [2026-08-08] Open question: backend auto-compact in `backend/agents.py` (~line 463) may re-send MCP servers and bypass the frontend fix — investigate that path next.
+- [2026-08-08] Project layout: React/TypeScript frontend under `src/` (`App.tsx`, `components/Chat.tsx`, `lib/{api,modes,store}.ts`, `styles/global.css`) and Python backend under `backend/` (`agents.py`, `server.py`). `MEMORY.md` sits at repo root.
+- [2026-08-08] In Ask mode (read-only), `git` commands can't be run; to inspect history, read `.git` internals directly (e.g., `.git/COMMIT_EDITMSG`, refs). Recent major work: per-turn Ask/Plan mode switching plus RPC Neovim tracking (see `src/lib/modes.ts`, `backend/agents.py`).
+- [2026-08-08] Auto-compact of context in `src/components/Chat.tsx` (~line 605) can trigger "Docker Desktop is not running" or `McpError: Connection closed` because it sends all MCPs at once.
+- [2026-08-08] `ResourceExhausted` errors come
+- [2026-08-08] There is an unresolved auto-compact issue in `backend/agents.py`, previously noted around lines ~463 and ~1932; future sessions should check this area when debugging errors.
+- [2026-08-08] The assistant operates in Ask mode (guidance only, no code execution), so error details must be provided by the user before fixes can be suggested.
+- [2026-08-08] Known unresolved issue: auto-compact problem in `backend/agents.py` around line ~463; may resurface as context/compact-related errors.
+- [2026-08-08] Project uses `backend/agents.py` as a key file; when debugging, check terminal logs and IDE Problems panel for full error text.

@@ -1,4 +1,4 @@
-import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, SidecarEvent } from '../types'
+import type { AgentMode, McpServerConfig, ModeCapabilities, NvimDiagnostic, ProviderConfig, SidecarEvent } from '../types'
 import { api } from './fs'
 
 let sidecarUrl: string | null = null
@@ -94,6 +94,8 @@ export interface StreamParams {
   allowOutside?: boolean
   /** Absolute path of the file currently open in Neovim (auto-mentioned). */
   nvimFile?: string
+  /** LSP diagnostics for the Neovim file, so the agent can see its issues. */
+  nvimDiagnostics?: NvimDiagnostic[]
   signal?: AbortSignal
 }
 
@@ -129,6 +131,7 @@ export async function streamChat(
       cap: params.cap ?? {},
       allow_outside: params.allowOutside ?? false,
       nvim_file: params.nvimFile ?? "",
+      nvim_diagnostics: params.nvimDiagnostics ?? [],
       context_window: params.provider.contextWindow ?? 0,
     }),
   })

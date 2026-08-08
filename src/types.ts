@@ -115,6 +115,20 @@ export interface TokenUsage {
   cacheWriteTokens?: number
 }
 
+/** One Language-Server diagnostic reported by Neovim for the active buffer.
+ *  `severity` is 1=Error, 2=Warning, 3=Information, 4=Hint (LSP LSPClient
+ *  number) or a string when the server reports it as text. */
+export interface NvimDiagnostic {
+  lnum: number
+  col: number
+  end_lnum?: number
+  end_col?: number
+  severity: number | string
+  source?: string
+  code?: string | number | null
+  message: string
+}
+
 export interface ChatMessage {
   id: string
   role: Role
