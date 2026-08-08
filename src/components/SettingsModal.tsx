@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { McpServerConfig, McpTransport, ProviderConfig, ProviderKind } from '../types'
+import type { AgentModeDef, McpServerConfig, McpTransport, ModeCapabilities, ProviderConfig, ProviderKind } from '../types'
 import { useStore, DEFAULT_MAX_HISTORY } from '../lib/store'
-import { fetchModels, fetchSystemPrompts, type SystemPrompts } from '../lib/api'
+import { fetchModels } from '../lib/api'
 import { api } from '../lib/fs'
 import { supportsReasoning } from '../lib/thinking'
+import { allModes, BUILTIN_IDS } from '../lib/modes'
 import { ModelPicker } from './ModelPicker'
+import { ModeIcon } from './ModeIcon'
 
 const KIND_LABELS: Record<ProviderKind, string> = {
   opencode: 'opencode gateway',
@@ -27,6 +29,8 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const recentModels = useStore((s) => s.recentModels)
   const addRecentModel = useStore((s) => s.addRecentModel)
   const setSystemPrompt = useStore((s) => s.setSystemPrompt)
+  const upsertMode = useStore((s) => s.upsertMode)
+  const removeMode = useStore((s) => s.removeMode)
   const fontSize = useStore((s) => s.fontSize)
   const setFontSize = useStore((s) => s.setFontSize)
 
@@ -40,44 +44,22 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [saved, setSaved] = useState(false)
   const [maxHistoryInput, setMaxHistoryInput] = useState(String(active.maxHistory ?? DEFAULT_MAX_HISTORY))
   const [envVarValue, setEnvVarValue] = useState<boolean | null>(null)
-  const [builtins, setBuiltins] = useState<SystemPrompts | null>(null)
-  const [chatPrompt, setChatPrompt] = useState<string | null>(null)
-  const [codewriterPrompt, setCodewriterPrompt] = useState<string | null>(null)
-  const [memoryText, setMemoryText] = useState<string>('')
-  const [memoryLoaded, setMemoryLoaded] = useState(false)
-  const [memMsg, setMemMsg] = useState('')
+  const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>(() => {
+    const d: Record<string, string> = {}
+    for (const m of allModes(settings)) d[m.id] = settings.systemPrompts?.[m.id] ?? ''
+    return d
+  })
+  const [modeDrafts, setModeDrafts] = useState<Record<string, AgentModeDef>>(() =>
+    Object.fromEntries((settings.modes ?? []).map((m) => [m.id, { ...m }])),
+  )
 
-  const [tab, setTab] = useState<'providers' | 'prompts' | 'fonts' | 'skills' | 'mcp'>('providers')
+  const [tab, setTab] = useState<'providers' | 'modes' | 'fonts' | 'skills' | 'mcp'>('providers')
+
+  const modes = allModes(settings)
 
   // ---- Skills & MCP tab state ----
   const root = useStore((s) => s.root)
 
-  const reloadMemory = useCallback(async () => {
-    if (!root) return
-    const r = await api.fsRead(root, '.coder/MEMORY.md').catch(() => null)
-    setMemoryText(r?.content ?? '')
-    setMemoryLoaded(true)
-  }, [root])
-
-  useEffect(() => {
-    void reloadMemory()
-  }, [reloadMemory])
-
-  const saveMemory = async () => {
-    if (!root) return
-    const ok = await api.fsWrite(root, '.coder/MEMORY.md', memoryText)
-    setMemMsg(ok ? 'Saved ✓' : 'Save failed.')
-    if (ok) void reloadMemory()
-  }
-
-  const clearMemory = async () => {
-    if (!root) return
-    if (window.confirm('Clear all memory notes?')) {
-      const ok = await api.fsWrite(root, '.coder/MEMORY.md', '')
-      setMemMsg(ok ? 'Cleared.' : 'Save failed.')
-      if (ok) setMemoryText('')
-    }
-  }
   const mcpServers = settings.mcpServers ?? {}
   const addMcpServer = useStore((s) => s.addMcpServer)
   const removeMcpServer = useStore((s) => s.removeMcpServer)
@@ -85,8 +67,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null)
   const [skillRaw, setSkillRaw] = useState('')
   const [skillsMsg, setSkillsMsg] = useState('')
-  const [newSkillOpen, setNewSkillOpen] = useState(false)
-  const [newSkillName, setNewSkillName] = useState('')
 
   const reloadSkills = useCallback(async (preferPath?: string) => {
     const found: Array<{ name: string; path: string; raw: string }> = []
@@ -122,23 +102,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     if (ok) void reloadSkills(selectedSkill)
   }
 
-  const newSkill = async () => {
-    const name = newSkillName.trim()
-    if (!name) return
-    const slug =
-      name
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '') || 'skill'
-    const rel = `skills/${slug}/SKILL.md`
-    const template = `---\nname: ${name}\ndescription: What this skill does and when to use it.\n---\n\n# ${name}\n\nWrite step-by-step instructions here. The agent reads this file when your request matches the skill.\n`
-    const ok = await api.coderWrite(rel, template)
-    setSkillsMsg(ok ? `Created ~/.coder/${rel} — edit the body below.` : 'Create failed.')
-    setNewSkillOpen(false)
-    setNewSkillName('')
-    if (ok) void reloadSkills(rel)
-  }
-
   const deleteSkill = async () => {
     if (!selectedSkill) return
     const folder = selectedSkill.slice(0, -'/SKILL.md'.length)
@@ -147,22 +110,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     setSkillsMsg(ok ? 'Deleted.' : 'Delete failed.')
     if (ok) void reloadSkills()
   }
-
-  // Fetch the built-in prompts once so the fields can be pre-filled and Reset works.
-  useEffect(() => {
-    let cancelled = false
-    void (async () => {
-      try {
-        const b = await fetchSystemPrompts()
-        if (!cancelled) setBuiltins(b)
-      } catch {
-        /* sidecar not running — Reset will be unavailable */
-      }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [])
 
   // Keep the local editor in sync when the active provider changes.
   useEffect(() => {
@@ -230,26 +177,21 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
   const selectedCtx = cfg.contextWindow && cfg.contextWindow > 0 ? cfg.contextWindow : undefined
 
-  const promptValue = (mode: 'chat' | 'codewriter') => {
-    const local = mode === 'chat' ? chatPrompt : codewriterPrompt
-    if (local !== null) return local
-    const saved = settings.systemPrompts?.[mode]
-    if (saved !== undefined) return saved
-    return builtins?.[mode] ?? ''
-  }
+  const setPrompt = (mode: string, value: string) =>
+    setPromptDrafts((d) => ({ ...d, [mode]: value }))
 
-  const resolvePrompt = (mode: 'chat' | 'codewriter') => {
-    const local = mode === 'chat' ? chatPrompt : codewriterPrompt
-    const v = (local !== null ? local : settings.systemPrompts?.[mode] ?? '').trim()
-    return v || builtins?.[mode] || ''
-  }
-
-  const save = () => {
+  const save = async () => {
     const historyN = parseInt(maxHistoryInput, 10)
     const cfgWithHistory =
       !Number.isNaN(historyN) && historyN > 0 ? { ...cfg, maxHistory: historyN } : { ...cfg, maxHistory: undefined }
-    setSystemPrompt('chat', resolvePrompt('chat'))
-    setSystemPrompt('codewriter', resolvePrompt('codewriter'))
+    const allIds = [...new Set([...allModes(settings).map((m) => m.id), ...Object.keys(modeDrafts)])]
+    for (const id of allIds) {
+      setSystemPrompt(id, (promptDrafts[id] ?? '').trim())
+    }
+    for (const def of Object.values(modeDrafts)) upsertMode(def)
+    for (const orig of settings.modes ?? []) {
+      if (!modeDrafts[orig.id]) removeMode(orig.id)
+    }
     if (cfgWithHistory.model) addRecentModel(cfgWithHistory.model)
     if (cfgWithHistory.model && !(active.models ?? []).includes(cfgWithHistory.model)) {
       setProviderModels(active.id, [...(active.models ?? []), cfgWithHistory.model])
@@ -258,6 +200,34 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     setSaved(true)
     setTimeout(onClose, 300)
   }
+
+  const addMode = () => {
+    const id = `m${Date.now().toString(36)}`
+    const def: AgentModeDef = {
+      id,
+      label: 'New mode',
+      icon: '⚙️',
+      description: 'A custom agent mode. Configure what it can do below.',
+      capabilities: { readFiles: true, writeFiles: false, runTerminal: false, web: true },
+    }
+    setModeDrafts((d) => ({ ...d, [id]: def }))
+  }
+
+  const patchMode = (id: string, patch: Partial<AgentModeDef>) =>
+    setModeDrafts((d) => {
+      const cur = d[id]
+      if (!cur) return d
+      return { ...d, [id]: { ...cur, ...patch } }
+    })
+
+  const patchCaps = (id: string, caps: Partial<ModeCapabilities>) =>
+    patchMode(id, { capabilities: { ...modeDrafts[id].capabilities, ...caps } })
+
+  const removeCustom = (id: string) =>
+    setModeDrafts((d) => {
+      const { [id]: _removed, ...rest } = d
+      return rest
+    })
 
   const handleAdd = () => {
     addProvider()
@@ -285,10 +255,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             Providers
           </button>
           <button
-            className={`settings-tab ${tab === 'prompts' ? 'active' : ''}`}
-            onClick={() => setTab('prompts')}
+            className={`settings-tab ${tab === 'modes' ? 'active' : ''}`}
+            onClick={() => setTab('modes')}
           >
-            Prompts
+            Modes
           </button>
           <button
             className={`settings-tab ${tab === 'fonts' ? 'active' : ''}`}
@@ -526,86 +496,109 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
         </>
         )}
 
-        {tab === 'prompts' && (
+        {tab === 'modes' && (
         <>
             <div className="field">
-              <label>System Prompts</label>
-              <label className="field-label">Chat</label>
-              <textarea
-                className="system-prompt"
-                value={promptValue('chat')}
-                onChange={(e) => setChatPrompt(e.target.value)}
-                rows={7}
-                dir="auto"
-                spellCheck={false}
-              />
-              <div className="prompt-actions">
-                <span className="hint">Clear the field to restore the built-in default.</span>
-                <button
-                  className="btn tiny"
-                  onClick={() => setChatPrompt(builtins?.chat ?? '')}
-                  disabled={!builtins}
-                >
-                  Reset
-                </button>
-              </div>
-
-              <label className="field-label">Code Writer</label>
-              <textarea
-                className="system-prompt"
-                value={promptValue('codewriter')}
-                onChange={(e) => setCodewriterPrompt(e.target.value)}
-                rows={7}
-                dir="auto"
-                spellCheck={false}
-              />
-              <div className="prompt-actions">
-                <span className="hint">Clear the field to restore the built-in default.</span>
-                <button
-                  className="btn tiny"
-                  onClick={() => setCodewriterPrompt(builtins?.codewriter ?? '')}
-                  disabled={!builtins}
-                >
-                  Reset
-                </button>
-              </div>
-              <div className="hint">
-                Changes apply on the next message. The workspace note is appended to whichever prompt you use.
-              </div>
-
-              <label className="field-label">Memory (.coder/MEMORY.md)</label>
-              {root ? (
-                <>
-                  <textarea
-                    className="system-prompt"
-                    value={memoryText}
-                    onChange={(e) => setMemoryText(e.target.value)}
-                    rows={8}
-                    dir="auto"
-                    spellCheck={false}
-                    placeholder="# Agent Memory&#10;&#10;## Important Notes&#10;- [YYYY-MM-DD] A durable fact about this project..."
-                  />
-                  <div className="prompt-actions">
-                    <span className="hint">
-                      {fmtBytes(new TextEncoder().encode(memoryText).length)} / {'50 KB'} — the agent's own
-                      notes. No longer loaded in full every session — the agent calls a search_memory tool
-                      to pull in only what's relevant to the current task. Exceeding the cap drops the
-                      oldest notes.
-                    </span>
-                    <span className="hint">{memMsg}</span>
-                    <div className="skill-actions">
-                      <button className="btn tiny danger" onClick={clearMemory} disabled={!memoryText}>
+              <label>Modes</label>
+              {modes.map((m) => {
+                const isBuiltin = BUILTIN_IDS.has(m.id)
+                const draft = modeDrafts[m.id]
+                const caps = isBuiltin ? m.capabilities : draft?.capabilities ?? m.capabilities
+                const label = isBuiltin ? m.label : draft?.label ?? m.label
+                const desc = isBuiltin ? m.description : draft?.description ?? m.description
+                return (
+                  <div className="mode-card" key={m.id}>
+                    <div className="mode-card-head">
+                      <span className="mode-card-icon"><ModeIcon icon={m.icon} /></span>
+                      <span className="mode-card-title">{label}</span>
+                      {isBuiltin ? (
+                        <span className="badge">built-in</span>
+                      ) : (
+                        <button className="btn tiny danger" onClick={() => removeCustom(m.id)}>
+                          Delete
+                        </button>
+                      )}
+                    </div>
+                    {isBuiltin ? (
+                      <p className="hint">{desc}</p>
+                    ) : (
+                      <>
+                        <label className="field-label">Name</label>
+                        <input
+                          className="text-input"
+                          value={label}
+                          onChange={(e) => patchMode(m.id, { label: e.target.value })}
+                          dir="auto"
+                        />
+                        <label className="field-label">Description</label>
+                        <textarea
+                          className="system-prompt"
+                          rows={2}
+                          value={desc}
+                          onChange={(e) => patchMode(m.id, { description: e.target.value })}
+                          dir="auto"
+                        />
+                      </>
+                    )}
+                    <label className="field-label">Custom prompt <span className="hint">(appended to the built-in prompt)</span></label>
+                    <textarea
+                      className="system-prompt"
+                      value={promptDrafts[m.id] ?? ''}
+                      onChange={(e) => setPrompt(m.id, e.target.value)}
+                      rows={7}
+                      dir="auto"
+                      spellCheck={false}
+                    />
+                    <div className="prompt-actions">
+                      <span className="hint">Changes apply on the next message.</span>
+                      <button className="btn tiny" onClick={() => setPrompt(m.id, '')}>
                         Clear
                       </button>
-                      <button className="btn tiny" onClick={saveMemory}>
-                        Save memory
-                      </button>
                     </div>
+                    {!isBuiltin && (
+                      <div className="cap-toggles">
+                        <label className="cap-toggle">
+                          <input
+                            type="checkbox"
+                            checked={caps.readFiles}
+                            onChange={(e) => patchCaps(m.id, { readFiles: e.target.checked })}
+                          />
+                          Read files
+                        </label>
+                        <label className="cap-toggle">
+                          <input
+                            type="checkbox"
+                            checked={caps.writeFiles}
+                            onChange={(e) => patchCaps(m.id, { writeFiles: e.target.checked })}
+                          />
+                          Write / edit files
+                        </label>
+                        <label className="cap-toggle">
+                          <input
+                            type="checkbox"
+                            checked={caps.runTerminal}
+                            onChange={(e) => patchCaps(m.id, { runTerminal: e.target.checked })}
+                          />
+                          Run terminal
+                        </label>
+                        <label className="cap-toggle">
+                          <input
+                            type="checkbox"
+                            checked={caps.web}
+                            onChange={(e) => patchCaps(m.id, { web: e.target.checked })}
+                          />
+                          Web access
+                        </label>
+                      </div>
+                    )}
                   </div>
-                </>
-              ) : (
-                <div className="hint">Open a project folder first to view and edit this project's memory.</div>
-              )}
+                )
+              })}
+              <div className="skill-actions">
+                <button className="btn tiny" onClick={addMode}>
+                  + New mode
+                </button>
+              </div>
             </div>
         </>
         )}
@@ -645,9 +638,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 MCP servers expose extra tools to the agent (filesystem, databases, APIs…). Changes
                 apply on the next message in any mode. Env/header values support{' '}
                 <code>{'${VAR}'}</code> and <code>{'${VAR:-default}'}</code> expansion from your shell
-                environment.
+                environment. Add a new connector by typing <code>/mcp &lt;description&gt;</code> in the chat,
+                then configure it here.
               </div>
               <div className="mcp-list">
+                {Object.entries(mcpServers).length === 0 && (
+                  <div className="hint">No MCP connectors yet. Add one with <code>/mcp &lt;description&gt;</code> in the chat.</div>
+                )}
                 {Object.entries(mcpServers).map(([name, cfg]) => (
                   <McpEditor
                     key={name}
@@ -662,13 +659,6 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     }}
                   />
                 ))}
-                <McpEditor
-                  key="__new__"
-                  initialName=""
-                  initialCfg={{}}
-                  onSave={(_old, newName, next) => addMcpServer(newName, next)}
-                  onDelete={() => undefined}
-                />
               </div>
             </div>
         </>
@@ -679,37 +669,16 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             <div className="field">
               <div className="field-head">
                 <label>Skills {root ? '— in the current workspace' : '(open a project folder first)'}</label>
-                {root && (
-                  <button className="btn tiny" onClick={() => setNewSkillOpen((o) => !o)}>
-                    {newSkillOpen ? 'Cancel' : '+ New skill'}
-                  </button>
-                )}
               </div>
               <div className="hint">
                 Skills are <code>SKILL.md</code> files the agent reads when your request matches them.
                 They live in <code>.coder/skills/&lt;name&gt;/SKILL.md</code> (or{' '}
-                <code>.claude/skills</code> for Claude Code compatibility).
+                <code>.claude/skills</code> for Claude Code compatibility). Create new skills by typing{' '}
+                <code>/skill &lt;description&gt;</code> in the chat.
               </div>
-              {newSkillOpen && (
-                <div className="new-skill-form">
-                  <input
-                    value={newSkillName}
-                    onChange={(e) => setNewSkillName(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') void newSkill()
-                    }}
-                    placeholder="Skill name (e.g. review)"
-                    dir="ltr"
-                    autoFocus
-                  />
-                  <button className="btn tiny" onClick={() => void newSkill()}>
-                    Create
-                  </button>
-                </div>
-              )}
               <div className="skill-list">
                 {skills.length === 0 && (
-                  <div className="hint">No skills yet. Create one to add reusable instructions.</div>
+                  <div className="hint">No skills yet. Create one with <code>/skill &lt;description&gt;</code> in the chat.</div>
                 )}
                 {skills.map((s) => {
                   const metaName = skillMeta(s.raw).name || s.name
@@ -776,11 +745,6 @@ function fmtTokens(n: number | undefined): string {
   return `${Math.round(n / 1000)}K`
 }
 
-function fmtBytes(n: number): string {
-  if (n < 1024) return `${n} B`
-  return `${(n / 1024).toFixed(1)} KB`
-}
-
 // ---- Skills & MCP helpers ------------------------------------------------ //
 
 /** Parse `name` / `description` out of a SKILL.md frontmatter block. */
@@ -844,6 +808,18 @@ function McpEditor({
   const [env, setEnv] = useState(kvToText(initialCfg.env ?? {}))
   const [headers, setHeaders] = useState(kvToText(initialCfg.headers ?? {}))
   const [error, setError] = useState('')
+  const [open, setOpen] = useState(false)
+
+  const transportLabel: Record<McpTransport, string> = {
+    stdio: 'stdio',
+    http: 'HTTP',
+    sse: 'SSE',
+  }
+
+  const summary = () =>
+    type === 'stdio'
+      ? (command || '…') + (args ? ' ' + args.trim() : '')
+      : url || '…'
 
   const build = (): McpServerConfig | null => {
     if (!name.trim()) {
@@ -872,11 +848,14 @@ function McpEditor({
   }
 
   return (
-    <div className="mcp-card">
-      <div className="mcp-card-head">
-        <span className="mcp-card-title">{initialName || '(new connector)'}</span>
+    <div className={`mcp-card ${open ? 'open' : ''}`}>
+      <div className="mcp-card-head" onClick={() => setOpen((o) => !o)}>
+        <span className={`mcp-chevron ${open ? 'open' : ''}`}>▶</span>
+        <span className="mcp-card-title">{name || initialName || 'new connector'}</span>
+        <span className="mcp-type">{transportLabel[type]}</span>
+        <span className="mcp-summary">{summary()}</span>
         <span className={`status-dot ${type === 'stdio' ? 'ok' : ''}`} />
-        <div className="mcp-card-actions">
+        <div className="mcp-card-actions" onClick={(e) => e.stopPropagation()}>
           <button className="btn tiny" onClick={save}>
             Save
           </button>
@@ -887,6 +866,7 @@ function McpEditor({
           )}
         </div>
       </div>
+      {open && (
       <div className="mcp-fields">
         <label className="field-label">Name</label>
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. filesystem" dir="ltr" />
@@ -950,6 +930,7 @@ function McpEditor({
           </div>
         )}
       </div>
+      )}
     </div>
   )
 }

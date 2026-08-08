@@ -36,6 +36,9 @@ export const api = {
   getPathForFile: (file: File): string => window.coder.getPathForFile(file),
   storeGet: <T>(key: string): Promise<T | null> => window.coder.storeGet<T>(key),
   storeSet: (key: string, value: unknown): Promise<boolean> => window.coder.storeSet(key, value),
+  getNvimFile: (): Promise<string | null> => window.coder.getNvimFile(),
+  onNvimFile: (cb: (f: { abs: string | null }) => void): (() => void) =>
+    window.coder.onNvimFile(cb),
 }
 
 const SKIP_DIRS = new Set([

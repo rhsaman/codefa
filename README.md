@@ -71,8 +71,8 @@ llama.cpp — بیشترِ کارها بر بستر و داده‌های خود�
 - **Two agent modes** — `Chat` (conversational coding assistant) and
   `Code Writer` (autonomous code-writing agent). Toggle at the top of the chat
   panel or with `Cmd/Ctrl+M`.
-- **Tool-based agent** — `read_file`, `write_file`, `list_files`,
-  `search_in_files`, plus MCP connectors, all executed by the Pydantic AI sidecar
+- **Tool-based agent** — `search_in_files`, `list_files`, `write_file`,
+  `edit_file`, plus MCP connectors, all executed by the Pydantic AI sidecar
   and constrained to the project root.
 - **Safe file access** — pick a project folder; every read/write/search is
   confined to it (path-traversal and symlink-escape guards in both Electron IPC
@@ -211,8 +211,8 @@ Pydantic AI ساخته شده و می‌تواند مستقیماً با کد ش
 - **دو حالتِ عامل** — «گفتگو» (دستیار مکالمه‌ای کدنویسی) و «نویسندهٔ کد» (عامل
   خودمختاری که مستقلاً کد می‌نویسد). با دکمهٔ بالای پنل گفتگو یا کلید `Cmd/Ctrl+M`
   می‌توانید میانشان جابه‌جا شوید.
-- **عاملِ ابزارمحور** — عملیات‌هایی مانند `read_file`، `write_file`،
-  `list_files` و `search_in_files` (و همچنین اتصال‌های MCP) همگی توسط
+- **عاملِ ابزارمحور** — عملیات‌هایی مانند `search_in_files`، `write_file`،
+  `list_files` و `edit_file` (و همچنین اتصال‌های MCP) همگی توسط
   sidecar پایتونی اجرا و به ریشهٔ پروژه محدود می‌شوند.
 - **دسترسی امن به فایل‌ها** — شما پوشهٔ پروژه را مشخص می‌کنید و تمام خواندن‌ها،
   نوشتن‌ها و جستجوها به همان پوشه محدود است؛ هم در سمت الکترون و هم در سمت

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useStore, workspaceKey } from '../lib/store'
-import type { Chat } from '../types'
+import type { Chat, Workspace } from '../types'
+import { api } from '../lib/fs'
 
 const WORKSPACE_COLORS = [
   '#ef4444',
@@ -33,43 +34,77 @@ interface Group {
   chats: Chat[]
 }
 
-function buildGroups(chats: Chat[], pinnedWorkspaces: string[]): Group[] {
-  const byRoot = new Map<string, Group>()
+/**
+ * Build sidebar groups from the PERSISTED workspace list (workspaces are
+ * first-class and outlive their chats), then attach chats by workspace key.
+ * Workspace order is user-controlled — only the chats INSIDE each workspace
+ * sort by recency. Pinned workspaces float to the very top (in pin order).
+ */
+function buildGroups(
+  chats: Chat[],
+  workspaces: Workspace[],
+  pinnedWorkspaces: string[],
+): Group[] {
+  const chatsByRoot = new Map<string, Chat[]>()
   for (const c of chats) {
     const key = workspaceKey(c.root ?? '')
-    if (!byRoot.has(key)) {
-      byRoot.set(key, {
-        key,
-        label: c.root ? rootName(c.root) : 'No project',
-        root: c.root ?? null,
-        chats: [],
-      })
-    }
-    byRoot.get(key)!.chats.push(c)
+    if (!chatsByRoot.has(key)) chatsByRoot.set(key, [])
+    chatsByRoot.get(key)!.push(c)
   }
-  const groups = [...byRoot.values()]
+
+  const groups: Group[] = []
+  for (const ws of workspaces) {
+    const list = chatsByRoot.get(ws.key) ?? []
+    list.sort((a, b) => b.updatedAt - a.updatedAt)
+    groups.push({
+      key: ws.key,
+      label: ws.label || (ws.root ? rootName(ws.root) : 'No project'),
+      root: ws.root,
+      chats: list,
+    })
+    chatsByRoot.delete(ws.key)
+  }
+
+  // Workspaces not yet in the persisted list (e.g. chats created before the
+  // first-class workspace feature, or new roots) — appended after the ordered
+  // ones so they never jump around the user's layout.
   const pinRank = (key: string) => {
     const i = pinnedWorkspaces.indexOf(key)
     return i === -1 ? Infinity : i
   }
-  // Pinned first (in pin order), then by most recent chat, then by label.
-  groups.forEach((g) => {
-    g.chats.sort((a, b) => b.updatedAt - a.updatedAt)
+  const leftovers = [...chatsByRoot.entries()].map(([key, list]) => {
+    list.sort((a, b) => b.updatedAt - a.updatedAt)
+    const root = list.find((c) => c.root)?.root ?? ''
+    return {
+      key,
+      label: root ? rootName(root) : 'No project',
+      root: root || null,
+      chats: list,
+    }
   })
-  groups.sort((a, b) => {
+  leftovers.sort((a, b) => {
     const ar = pinRank(a.key)
     const br = pinRank(b.key)
     if (ar !== br) return ar - br
     const aLatest = Math.max(...a.chats.map((c) => c.updatedAt), 0)
     const bLatest = Math.max(...b.chats.map((c) => c.updatedAt), 0)
-    if (aLatest !== bLatest) return bLatest - aLatest
-    return a.label.localeCompare(b.label)
+    return bLatest - aLatest
   })
-  return groups
+
+  const ordered = [...groups, ...leftovers]
+  // Pinned float to top, in pin order; the rest keep the persisted order.
+  ordered.sort((a, b) => {
+    const ar = pinRank(a.key)
+    const br = pinRank(b.key)
+    if (ar !== br) return ar - br
+    return 0
+  })
+  return ordered
 }
 
 export function Sidebar() {
   const chats = useStore((s) => s.chats)
+  const workspaces = useStore((s) => s.workspaces)
   const activeChatId = useStore((s) => s.activeChatId)
   const theme = useStore((s) => s.theme)
   const workspaceColors = useStore((s) => s.workspaceColors)
@@ -78,11 +113,54 @@ export function Sidebar() {
   const [colorOpen, setColorOpen] = useState<string | null>(null)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [dragKey, setDragKey] = useState<string | null>(null)
+  const [dragOverKey, setDragOverKey] = useState<string | null>(null)
 
   const open = useStore((s) => s.sidebarOpen)
   if (!open) return null
 
-  const groups = buildGroups(chats, pinnedWorkspaces)
+  const groups = buildGroups(chats, workspaces, pinnedWorkspaces)
+
+  const newWorkspace = async () => {
+    const dir = await api.selectFolder()
+    if (dir) useStore.getState().createWorkspace(dir)
+  }
+
+  const onDragStart = (e: React.DragEvent, key: string) => {
+    setDragKey(key)
+    e.dataTransfer.effectAllowed = 'move'
+    try {
+      e.dataTransfer.setData('text/plain', key)
+    } catch {
+      /* ignore dataTransfer restrictions (rare) */
+    }
+  }
+
+  const onDragOver = (e: React.DragEvent, key: string) => {
+    e.preventDefault()
+    e.dataTransfer.dropEffect = 'move'
+    setDragOverKey(key)
+  }
+
+  const onDrop = (e: React.DragEvent, targetKey: string) => {
+    e.preventDefault()
+    const from = dragKey || (e.dataTransfer.getData('text/plain') as string) || ''
+    setDragKey(null)
+    setDragOverKey(null)
+    if (!from || from === targetKey) return
+    const keys = groups.map((g) => g.key)
+    const i = keys.indexOf(from)
+    const j = keys.indexOf(targetKey)
+    if (i === -1) return
+    keys.splice(i, 1)
+    keys.splice(j, 0, from)
+    useStore.getState().setWorkspaceOrder(keys)
+  }
+
+  const onDragEnd = () => {
+    setDragKey(null)
+    setDragOverKey(null)
+  }
 
   const toggleGroup = (key: string) => {
     setCollapsed((prev) => {
@@ -106,11 +184,11 @@ export function Sidebar() {
   return (
     <aside className="sidebar">
       <div className="sidebar-new">
-        <button className="sidebar-new-btn" onClick={() => useStore.getState().newChat()}>
+        <button className="sidebar-new-btn" onClick={newWorkspace} title="Create a new workspace">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
             <path d="M12 5v14M5 12h14" />
           </svg>
-          New chat
+          New workspace
         </button>
       </div>
 
@@ -122,7 +200,16 @@ export function Sidebar() {
           const color = workspaceColors[g.key]
           const isPinned = pinnedWorkspaces.includes(g.key)
           return (
-            <div key={g.key} className={`sidebar-group${isPinned ? ' pinned' : ''}`} style={color ? { '--ws': color } as React.CSSProperties : undefined}>
+            <div
+              key={g.key}
+              className={`sidebar-group${isPinned ? ' pinned' : ''}${dragKey === g.key ? ' dragging' : ''}${dragOverKey === g.key && dragKey && dragKey !== g.key ? ' drop-target' : ''}`}
+              style={color ? { '--ws': color } as React.CSSProperties : undefined}
+              draggable
+              onDragStart={(e) => onDragStart(e, g.key)}
+              onDragOver={(e) => onDragOver(e, g.key)}
+              onDrop={(e) => onDrop(e, g.key)}
+              onDragEnd={onDragEnd}
+            >
               <div className="sidebar-group-head">
                 <button className="sidebar-group-toggle" onClick={() => toggleGroup(g.key)} title={g.root || g.label}>
                   <svg className="sidebar-group-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">

@@ -1,6 +1,24 @@
 export type ProviderKind = 'opencode' | 'openrouter' | 'ollama' | 'custom'
 
-export type AgentMode = 'chat' | 'codewriter'
+export type AgentMode = string
+
+/** Per-mode tool access. Sent to the backend so tool gating is data-driven
+ *  instead of hardcoded to mode names — lets anyone add custom modes. */
+export interface ModeCapabilities {
+  readFiles: boolean // list / search / fuzzy_find
+  writeFiles: boolean // write_file / edit_file
+  runTerminal: boolean // run_terminal
+  web: boolean // web_search / fetch_url
+}
+
+/** One agent mode: built-in (ask / plan / coder) or user-created. */
+export interface AgentModeDef {
+  id: AgentMode
+  label: string
+  icon?: string
+  description: string
+  capabilities: ModeCapabilities
+}
 
 export type ThinkingLevel =
   | ''
@@ -45,7 +63,9 @@ export interface ProviderConfig {
 export interface Settings {
   providers: ProviderConfig[]
   activeProviderId: string
-  systemPrompts?: { chat?: string; codewriter?: string }
+  systemPrompts?: Record<string, string>
+  /** User-created modes; built-ins live in `src/lib/modes.ts`. */
+  modes?: AgentModeDef[]
   /** MCP tool connectors (key = connector name), sent to the agent each run. */
   mcpServers?: Record<string, McpServerConfig>
   fontSize?: number
@@ -59,6 +79,19 @@ export interface Settings {
   workspaceColors?: Record<string, string>
   /** Workspace keys pinned to the top of the sidebar, most-recently-pinned first. */
   pinnedWorkspaces?: string[]
+  /** Persisted workspace list — workspaces outlive their chats (deleting all a
+   *  workspace's chats does NOT remove the workspace itself). Empty workspaces
+   *  still render. Order is user-controlled (drag-and-drop in the sidebar). */
+  workspaces?: Workspace[]
+}
+
+/** A first-class workspace in the sidebar. ``root`` is the project folder; may
+ *  be null for the "No project" bucket. Workspaces are only removed via the
+ *  sidebar trash button, never by deleting their chats. */
+export interface Workspace {
+  key: string
+  root: string | null
+  label: string
 }
 
 export type Role = 'user' | 'assistant' | 'system' | 'tool'
@@ -88,6 +121,7 @@ export interface ChatMessage {
   content: string
   mode?: AgentMode
   toolActivity?: ToolActivity[]
+  plan?: Array<{ content: string; status: string }>
   thinking?: string
   /** True while this assistant message is still being generated (live status line). */
   streaming?: boolean
@@ -120,13 +154,18 @@ export interface Chat {
 }
 
 export interface SidecarEvent {
-  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'compact'
+  kind: 'text' | 'thinking' | 'tool' | 'tool_result' | 'diff' | 'error' | 'done' | 'usage' | 'retry' | 'compact' | 'plan' | 'permission'
   content?: string
   tool?: string
   args?: Record<string, unknown>
   summary?: string
   diff?: string
   path?: string
+  /** update_plan items: [{ content, status }] */
+  items?: Array<{ content: string; status: string }>
+  /** permission request id (echoed back via /permission/respond) */
+  id?: string
+  action?: string
   input_tokens?: number
   output_tokens?: number
   total_tokens?: number

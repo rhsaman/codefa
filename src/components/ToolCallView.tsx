@@ -4,8 +4,6 @@ import { useStore } from '../lib/store'
 import { api } from '../lib/fs'
 
 const TOOL_LABEL: Record<string, string> = {
-  read_file: 'read_file',
-  read_lines: 'read_lines',
   write_file: 'write_file',
   list_files: 'list_files',
   search_in_files: 'search_in_files',

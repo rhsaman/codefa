@@ -1,4 +1,5 @@
 import { app, BrowserWindow, ipcMain, dialog, desktopCapturer, nativeImage, screen } from 'electron'
+import { execFile } from 'child_process'
 import * as path from 'path'
 import * as os from 'os'
 import * as fs from 'fs'
@@ -21,6 +22,82 @@ import {
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL
 let mainWindow: BrowserWindow | null = null
+
+// --- Neovim "open file" tracking -------------------------------------------
+// The user runs nvim with `--listen <socket>` (or a wrapper). We discover the
+// running nvim instances, query the focused buffer directly over the RPC socket
+// and push the path to the renderer so it can show the "open in Neovim" label.
+// Nothing is written to the user's config and no helper files are installed.
+let lastNvimAbs: string | null = null
+let nvimPollTimer: ReturnType<typeof setInterval> | null = null
+
+/** Unix sockets listening for nvim RPC, found via `lsof` (matches any process
+ *  whose command name contains "nvim" — the `--listen` socket lives wherever
+ *  the user put it, so we can't guess the path). */
+function findNvimSockets(): Promise<string[]> {
+  return new Promise((resolve) => {
+    execFile(
+      'lsof',
+      ['-nP', '-c', 'nvim', '-U', '-F0n'],
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err || !stdout) return resolve([])
+        const out: string[] = []
+        for (const rec of stdout.split('\0')) {
+          if (!rec.startsWith('n')) continue
+          let p = rec.slice(1)
+          if (p.startsWith('->')) p = p.slice(2) // connected socket form
+          if (!p.startsWith('/')) continue
+          try {
+            if (fs.statSync(p).isSocket()) out.push(p)
+          } catch {
+            /* gone before stat */
+          }
+        }
+        resolve([...new Set(out)])
+      },
+    )
+  })
+}
+
+/** Ask one nvim instance for the absolute path of its currently focused buffer
+ *  (`expand('%:p')` returns '' for unnamed buffers). */
+function queryNvimBuffer(socket: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      'nvim',
+      ['--server', socket, '--remote-expr', 'expand("%:p")'],
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) return resolve(null)
+        const v = String(stdout ?? '').trim()
+        resolve(v || null)
+      },
+    )
+  })
+}
+
+async function pollNvimFile(): Promise<void> {
+  const sockets = await findNvimSockets()
+  let abs: string | null = null
+  for (const sock of sockets.slice(0, 8)) {
+    abs = await queryNvimBuffer(sock)
+    if (abs) break
+  }
+  if (abs === lastNvimAbs) return
+  lastNvimAbs = abs
+  for (const win of BrowserWindow.getAllWindows()) {
+    win.webContents.send('nvim:file', { abs })
+  }
+}
+
+function watchNvimFile(): void {
+  if (nvimPollTimer) return
+  const tick = (): void => void pollNvimFile()
+  nvimPollTimer = setInterval(tick, 1500)
+  nvimPollTimer.unref?.()
+  tick()
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -53,6 +130,9 @@ function createWindow(): void {
 function registerIpc(): void {
   // --- sidecar --------------------------------------------------------------
   ipcMain.handle('sidecar:url', async () => getSidecarUrl())
+
+  // --- neovim open-file state ----------------------------------------------
+  ipcMain.handle('nvim:get', () => lastNvimAbs)
 
   // --- global environment (used for API keys / base URLs) -------------------
   // Any env var may be looked up so the Settings UI can check a user-specified
@@ -280,6 +360,8 @@ app.whenReady().then(async () => {
   createWindow()
   // Start the sidecar lazily; failures are surfaced in the UI, not fatal.
   getSidecarUrl().catch((err) => console.error('sidecar startup failed:', err))
+  // Track the file open in Neovim (live RPC socket poll; see watchNvimFile).
+  watchNvimFile()
 })
 
 app.on('window-all-closed', () => {

@@ -5,6 +5,7 @@ import rehypeHighlight from 'rehype-highlight'
 import type { ChatMessage } from '../types'
 import { fixMixedText, prepareContent } from '../lib/bidi'
 import { useStore } from '../lib/store'
+import { getMode } from '../lib/modes'
 import { ToolCallView } from './ToolCallView'
 import 'highlight.js/styles/github-dark.min.css'
 
@@ -172,7 +173,10 @@ function UsageBadge({ input, output, total }: { input: number; output: number; t
 export function ChatMessageView({ message, onRetry }: { message: ChatMessage; onRetry?: (id: string) => void }) {
   const isUser = message.role === 'user'
   const dir = useStore((s) => s.dir)
+  const settings = useStore((s) => s.settings)
   const [copied, setCopied] = useState(false)
+
+  const modeLabel = (id: string) => getMode(settings, id).label
 
   const copyMessage = async () => {
     try {
@@ -187,7 +191,7 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
   return (
     <div className={`msg ${isUser ? 'user' : ''} ${message.error ? 'error' : ''}`}>
       <div className="msg-role">
-        {isUser ? 'You' : message.role === 'tool' ? 'Tools' : message.mode === 'codewriter' ? 'Code Writer' : 'Assistant'}
+        {isUser ? 'You' : message.role === 'tool' ? 'Tools' : message.mode ? modeLabel(message.mode) : 'Assistant'}
       </div>
 
       {!isUser && message.streaming && !message.retry && (
@@ -209,6 +213,28 @@ export function ChatMessageView({ message, onRetry }: { message: ChatMessage; on
       )}
 
       {!isUser && message.thinking && <ThinkingBlock text={message.thinking} />}
+
+      {!isUser && message.plan && message.plan.length > 0 && (
+        <div className="plan-block">
+          <div className="plan-head">
+            <span className="plan-dot">◎</span>
+            <span className="plan-label">Plan</span>
+          </div>
+          <ul className="plan-list">
+            {message.plan.map((item, i) => (
+              <li
+                key={i}
+                className={`plan-item ${item.status === 'completed' ? 'done' : item.status === 'in-progress' ? 'running' : ''}`}
+              >
+                <span className="plan-item-mark">
+                  {item.status === 'completed' ? '✓' : item.status === 'in-progress' ? '●' : '○'}
+                </span>
+                <span className="plan-item-content">{item.content}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {!isUser && message.retry && (
         <RetryBanner

@@ -24,8 +24,5 @@ const REASONING_PATTERNS: RegExp[] = [
 export function supportsReasoning(modelId: string, kind: ProviderKind = 'opencode'): boolean {
   const id = (modelId || '').trim()
   if (!id) return false
-  if (kind === 'ollama' || kind === 'custom') {
-    return REASONING_PATTERNS.some((re) => re.test(id))
-  }
-  return true
+  return REASONING_PATTERNS.some((re) => re.test(id))
 }

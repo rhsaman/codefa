@@ -279,3 +279,35 @@ async def list_models(
 
     _model_cache[cache_key] = (time.monotonic(), models)
     return models
+
+
+async def model_context(
+    provider: str, model: str, base_url: str = "", api_key: str = "", env_var: str = ""
+) -> int:
+    """Resolve a specific model's context-window length (tokens).
+
+    Tries the provider's advertised window first (openrouter ``context_length``,
+    opencode curated map, ollama /api/show, custom ``max_model_len``). Falls
+    back to a conservative floor ONLY when the model is truly unknown — never a
+    hard-coded cap, and never under-reporting a model whose real window the
+    provider advertises.
+
+    Returns 0 when nothing can be determined.
+    """
+    if not model:
+        return 0
+    try:
+        enlisted = await list_models(provider, base_url, api_key, env_var)
+        for entry in enlisted:
+            if entry.get("id") == model and entry.get("context"):
+                return int(entry["context"])
+    except Exception:  # noqa: BLE001
+        pass
+    # opencode exposes known-capacity models even when list_models fails
+    # (offline / transient). Consult the curated map for exact known models.
+    if provider == "opencode" and not base_url:
+        if model in OPENCODE_CONTEXT:
+            return OPENCODE_CONTEXT[model]
+        if model.endswith("-free"):
+            return 200_000
+    return 0

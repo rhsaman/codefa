@@ -1,4 +1,4 @@
-import type { McpServerConfig, ProviderConfig, SidecarEvent } from '../types'
+import type { AgentMode, McpServerConfig, ModeCapabilities, ProviderConfig, SidecarEvent } from '../types'
 import { api } from './fs'
 
 let sidecarUrl: string | null = null
@@ -13,22 +13,6 @@ export async function ensureSidecar(): Promise<string | null> {
 export interface ModelsResult {
   models: string[]
   context: Record<string, number>
-}
-
-export interface SystemPrompts {
-  chat: string
-  codewriter: string
-}
-
-export async function fetchSystemPrompts(): Promise<SystemPrompts> {
-  const url = await ensureSidecar()
-  if (!url) throw new Error('Python agent not ready — run `npm run setup`')
-  const res = await fetch(`${url}/system-prompts`, { signal: AbortSignal.timeout(30_000) })
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error((body as { detail?: string }).detail || `system prompts request failed (${res.status})`)
-  }
-  return (await res.json()) as SystemPrompts
 }
 
 /**
@@ -90,7 +74,7 @@ export async function fetchModels(cfg: ProviderConfig): Promise<ModelsResult> { 
 export interface StreamParams {
   provider: ProviderConfig
   root: string
-  mode: 'chat' | 'codewriter'
+  mode: AgentMode
   prompt: string
   history: Array<{ role: string; content: string }>
   attachments?: string[]
@@ -100,6 +84,14 @@ export interface StreamParams {
   mcpServers?: Record<string, McpServerConfig>
   /** Names of skills selected for this turn (only these are loaded). */
   skills?: string[]
+  /** Allow the agent to create skills / MCP connectors (via /skill /mcp). */
+  allowCreate?: boolean
+  /** Per-mode tool capabilities sent to the backend for tool gating. */
+  cap?: ModeCapabilities
+  /** User pre-approved outside-workspace access for this session/workspace. */
+  allowOutside?: boolean
+  /** Absolute path of the file currently open in Neovim (auto-mentioned). */
+  nvimFile?: string
   signal?: AbortSignal
 }
 
@@ -130,6 +122,10 @@ export async function streamChat(
       thinking_level: params.thinkingLevel ?? '',
       mcp_servers: params.mcpServers ?? {},
       skills: params.skills ?? [],
+      allow_create: params.allowCreate ?? false,
+      cap: params.cap ?? {},
+      allow_outside: params.allowOutside ?? false,
+      nvim_file: params.nvimFile ?? "",
       context_window: params.provider.contextWindow ?? 0,
     }),
   })
@@ -169,5 +165,23 @@ export async function streamChat(
     }
   } finally {
     reader.releaseLock()
+  }
+}
+
+/** Answer a pending outside-workspace permission request from the agent. */
+export async function respondPermission(
+  id: string,
+  allowed: boolean,
+): Promise<void> {
+  const url = await ensureSidecar()
+  if (!url) return
+  try {
+    await fetch(`${url}/permission/respond`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, allowed }),
+    })
+  } catch {
+    /* best effort */
   }
 }

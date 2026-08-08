@@ -16,8 +16,9 @@ import shutil
 import signal
 import subprocess
 import unicodedata
+import uuid
 from datetime import datetime, timezone
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 MAX_READ_BYTES = 2_000_000  # 2 MB
 MAX_SEARCH_RESULTS = 200
@@ -25,9 +26,9 @@ MAX_FILES = 10_000
 MAX_TERMINAL_OUTPUT = 30_000
 TERMINAL_TIMEOUT = 120
 TERMINAL_TIMEOUT_MAX = 300
-MAX_WEB_SEARCH_RESULTS = 8
+MAX_WEB_SEARCH_RESULTS = 5
+WEB_SEARCH_SNIPPET_MAX = 200  # per-result snippet cap to keep search context lean
 WEB_SEARCH_TIMEOUT = 15
-MAX_LINES_PER_READ = 400  # per read_lines call
 SEARCH_TIMEOUT = 20  # seconds for a ripgrep search
 
 # DuckDuckGo HTML search backend (no API key required). Imported lazily inside
@@ -115,11 +116,56 @@ def _exec_terminal(command: str, root: str, timeout: int) -> tuple[int, str]:
     return code, output
 
 
-def run_terminal(root: str, command: str, timeout: int = TERMINAL_TIMEOUT) -> dict:
+def _escapes_root(command: str, root: str) -> str | None:
+    """Return a reason string if ``command`` references paths outside ``root``.
+
+    The file tools are already sandboxed through ``resolve_safe``; this gives the
+    terminal the same guarantee so the agent can't drift into ``~/.config``,
+    ``/Users/...`` or any other path outside the selected workspace on its own.
+    """
+    root_real = os.path.realpath(os.path.abspath(root))
+    # Home / $HOME expansions point outside the workspace.
+    # Home / $HOME expansions point outside the workspace. `$` is not a word
+    # char, so a leading `\b` can't anchor `$HOME` after a space/`=` — anchor on
+    # the preceding non-word char (or start) instead.
+    if re.search(
+        r"~\s*(/|\\)?|(?:^|[^\w])\$HOME\b|(?:^|[^\w])\$\{HOME\}|(?:^|[^\w])\{HOME\}",
+        command,
+        re.IGNORECASE,
+    ):
+        return "references paths outside the project root (~ / $HOME)"
+    # `..` can climb out of root.
+    if re.search(r"(^|[\s;|&])\.\.(/|\s|$)", command):
+        return "references paths outside the project root (..)"
+    # Absolute paths must lie inside the workspace (or be a safe system sink).
+    _SAFE_ABS = ("/dev/null", "/tmp/", "/dev/std", "/dev/fd")
+    for m in re.finditer(r"(?:^|[\s;|&])(/[^\s;|&'\"`]*)", command):
+        p = m.group(1)
+        if p.startswith(_SAFE_ABS):
+            continue
+        try:
+            real = os.path.realpath(p)
+        except Exception:  # noqa: BLE001
+            real = p
+        if real != root_real and not real.startswith(root_real + os.sep):
+            return f"references path outside the project root: {p}"
+    return None
+
+
+def run_terminal(
+    root: str, command: str, timeout: int = TERMINAL_TIMEOUT, permit: dict | None = None
+) -> dict:
     """Run a shell command in the workspace root and capture its output."""
     reason = _blocked_terminal(command)
     if reason:
         return {"command": command, "error": reason}
+    if not (permit or {}).get("outside"):
+        reason = _escapes_root(command, root)
+        if reason:
+            return {
+                "command": command,
+                "error": f"{reason}. Ask the user for permission (request_permission) before accessing anything outside the workspace.",
+            }
     try:
         code, output = _exec_terminal(command, root, min(timeout, TERMINAL_TIMEOUT_MAX))
     except OSError as exc:
@@ -234,49 +280,6 @@ def read_file(root: str, path: str) -> dict:
     return {"path": path, "content": content, "truncated": truncated}
 
 
-def read_lines(root: str, path: str, start: int = 1, end: int = -1) -> dict:
-    """Read a line range ``[start, end]`` of ``path`` (relative to root).
-
-    Only the requested lines are returned, keeping context use low on large
-    files. Line numbers are 1-based; ``end <= 0`` means "to the end of file".
-    The range is capped to ``MAX_LINES_PER_READ`` lines per call.
-    """
-    target = resolve_safe(root, path)
-    if not os.path.exists(target):
-        return {"path": path, "error": "file not found"}
-    if os.path.isdir(target):
-        return {"path": path, "error": "path is a directory"}
-    if not _is_text_path(target):
-        return {"path": path, "error": "binary file (read skipped)"}
-    try:
-        start = max(1, int(start))
-        end = int(end) if end and int(end) > 0 else None
-        if end is not None and end < start:
-            end = start
-        selected: list[tuple[int, str]] = []
-        with open(target, "r", encoding="utf-8", errors="replace") as fh:
-            for lineno, line in enumerate(fh, start=1):
-                if start <= lineno <= (end or lineno) and (end is None or lineno <= end):
-                    selected.append((lineno, line.rstrip("\n")))
-                if end is not None and lineno >= end:
-                    break
-        first = selected[0][0] if selected else None
-        lines = [ln for _, ln in selected]
-        if len(lines) > MAX_LINES_PER_READ:
-            lines = lines[:MAX_LINES_PER_READ]
-            truncated = True
-        else:
-            truncated = False
-        return {
-            "path": path,
-            "start": first,
-            "lines": lines,
-            "truncated": truncated,
-        }
-    except (OSError, ValueError) as exc:
-        return {"path": path, "error": str(exc)}
-
-
 def write_file(root: str, path: str, content: str) -> dict:
     """Write ``content`` to ``path`` (relative to root). Creates parent dirs."""
     target = resolve_safe(root, path)
@@ -308,7 +311,7 @@ def slugify(name: str) -> str:
     return slug or "skill"
 
 
-LEARNED_MEMORY_FILE = ".coder/MEMORY.md"
+LEARNED_MEMORY_FILE = "MEMORY.md"
 LEARNED_MEMORY_MAX_BYTES = 50_000
 MEMORY_SEARCH_MAX_RESULTS = 15
 _MEMORY_HEADER = "# Agent Memory\n\n## Important Notes\n"
@@ -378,7 +381,7 @@ def _remember_fill(target: str, note: str, stamp: str) -> dict:
 
 def remember(root: str, note: str) -> dict:
     """Append a short, durable note to the project's self-written memory file
-    (``<root>/.coder/MEMORY.md``), so future sessions in this project start
+    (``<root>/MEMORY.md``), so future sessions in this project start
     with what the agent already learned.
 
     This file is written by the agent itself across sessions — conventions it
@@ -663,7 +666,7 @@ def edit_file(
     if truncated:
         return {
             "path": path,
-            "error": "file too large to edit safely (read it in chunks with read_lines instead)",
+            "error": "file too large to edit safely (use search_in_files to inspect it in parts instead)",
         }
 
     count = content.count(old_string)
@@ -708,8 +711,8 @@ def _search_python(root: str, query: str, path: str, ctx: int) -> dict:
     does not honour ``.gitignore``, but returns the same result shape.
     """
     target = resolve_safe(root, path)
-    if not os.path.isdir(target):
-        target = os.path.dirname(target) if os.path.isfile(target) else target
+    if not os.path.isdir(target) and not os.path.isfile(target):
+        return {"query": query, "matches": [], "truncated": False, "error": f"path not found: {path}"}
 
     try:
         pattern = re.compile(query, re.IGNORECASE)
@@ -717,7 +720,10 @@ def _search_python(root: str, query: str, path: str, ctx: int) -> dict:
         pattern = re.compile(re.escape(query), re.IGNORECASE)
 
     matches: list[dict] = []
-    for file in _walk_files(target):
+    # Same fix as `_rg_search`: a `path` that names a single file searches only
+    # that file, instead of silently widening to its parent directory.
+    files = [target] if os.path.isfile(target) else _walk_files(target)
+    for file in files:
         if not _is_text_path(file):
             continue
         rel = os.path.relpath(file, resolve_safe(root, "")).replace(os.sep, "/")
@@ -757,8 +763,16 @@ def _rg_search(root: str, query: str, path: str, ctx: int) -> dict | None:
     except PathEscapeError:
         raise
     root_real = os.path.realpath(os.path.abspath(root))
-    if not os.path.isdir(target):
-        target = os.path.dirname(target) if os.path.isfile(target) else target
+    # IMPORTANT: when `path` names a single FILE, search that file only. This
+    # used to silently widen to the file's parent directory whenever the path
+    # wasn't itself a directory, so "search X inside path/to/File.tsx" quietly
+    # searched the whole containing folder instead — the agent kept getting
+    # matches from unrelated sibling files, couldn't tell why, and burned many
+    # extra tool calls re-querying to figure out which file something was
+    # actually in. A path that resolves to neither a file nor a directory (a
+    # typo) is now reported as a clean error instead of guessing.
+    if not os.path.isdir(target) and not os.path.isfile(target):
+        return {"query": query, "matches": [], "truncated": False, "error": f"path not found: {path}"}
 
     search_arg = os.path.relpath(target, root_real).replace(os.sep, "/")
     if search_arg in (".", ""):
@@ -945,22 +959,26 @@ def web_search(query: str, max_results: int = 5) -> dict:
     return {"query": query, "results": results}
 
 
-MAX_FETCH_BYTES = 1_000_000
+MAX_FETCH_BYTES = 250_000
 FETCH_TIMEOUT = 15
+# Intermediate cap applied to a fetched page BEFORE it is handed to the
+# summarizer model. It is not the context budget (that comes from the model's
+# reported window via `tool_out_chars`) — it only bounds the summarizer input.
+FETCH_EXCERPT_CHARS = 24_000
 
 
-def fetch_url(url: str, max_chars: int = 6000) -> dict:
-    """Fetch a web page and return its text content.
+def fetch_url(url: str, max_chars: int = FETCH_EXCERPT_CHARS) -> dict:
+    """Fetch a web page and return its extracted text.
 
     Returns ``{"url", "title", "content"}`` on success or ``{"url", "error"}``
     with a friendly reason otherwise. HTML is stripped to plain text; binary /
-    non-text responses are rejected; content is capped so the result stays
-    small enough for the model's context window. Never raises.
+    non-text responses are rejected; content is capped at ``max_chars`` so a
+    single page can never flood the context window. Never raises.
     """
     url = (url or "").strip()
     if not url.startswith(("http://", "https://")):
         return {"url": url, "error": "url must start with http:// or https://"}
-    max_chars = max(500, min(int(max_chars or 6000), MAX_FETCH_BYTES))
+    max_chars = max(500, min(int(max_chars or FETCH_EXCERPT_CHARS), MAX_FETCH_BYTES))
     try:
         import httpx
 
@@ -1012,14 +1030,31 @@ def _html_to_text(html: str) -> tuple[str, str]:
     title_done = False
     out: list[str] = []
     skip = 0  # depth of <script>/<style> blocks to drop
+    chrome = 0  # depth of nav/aside/footer/header regions to drop
 
     class _P(HTMLParser):
         nonlocal_skip = 0
+        nonlocal_chrome = 0
 
         def handle_starttag(self, tag, attrs):
             if tag in ("script", "style", "noscript"):
                 self.nonlocal_skip += 1
-            elif tag in ("p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote"):
+            elif tag in ("nav", "aside", "footer", "header"):
+                self.nonlocal_chrome += 1
+            elif (tag == "div" and self.nonlocal_chrome == 0) or tag in (
+                "p",
+                "br",
+                "li",
+                "tr",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "pre",
+                "blockquote",
+            ):
                 out.append("\n")
             elif tag == "a":
                 pass
@@ -1032,7 +1067,22 @@ def _html_to_text(html: str) -> tuple[str, str]:
         def handle_endtag(self, tag):
             if tag in ("script", "style", "noscript"):
                 self.nonlocal_skip = max(0, self.nonlocal_skip - 1)
-            elif tag in ("p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "blockquote"):
+            elif tag in ("nav", "aside", "footer", "header"):
+                self.nonlocal_chrome = max(0, self.nonlocal_chrome - 1)
+            elif (tag == "div" and self.nonlocal_chrome == 0) or tag in (
+                "p",
+                "div",
+                "li",
+                "tr",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "pre",
+                "blockquote",
+            ):
                 out.append("\n")
 
         def handle_data(self, data):
@@ -1040,7 +1090,7 @@ def _html_to_text(html: str) -> tuple[str, str]:
             if not title_done and self.nonlocal_skip == 0:
                 # capture the first <title> text
                 pass
-            if self.nonlocal_skip > 0:
+            if self.nonlocal_skip > 0 or self.nonlocal_chrome > 0:
                 return
             s = data.strip()
             if s:
@@ -1133,6 +1183,9 @@ def make_tool_callbacks(
     root: str,
     emit: Callable[[dict], None],
     context_window: int = 0,
+    summarizer_model: Any = None,
+    permission_gates: dict | None = None,
+    permit: dict | None = None,
 ) -> dict[str, Callable]:
     """Build the agent tools bound to ``root`` with an emit callback.
 
@@ -1152,10 +1205,10 @@ def make_tool_callbacks(
     # that prevent overflow / mid-task truncation.
     if context_window and context_window > 0:
         ctx = int(context_window)
-        tool_out_chars = max(400, min((ctx // 12) - 150, 4_000))
+        tool_out_chars = max(400, min((ctx // 12) - 150, 3_000))
         listing_count = max(15, ctx // 600)
         search_count = max(10, ctx // 500)
-        terminal_out_chars = min(MAX_TERMINAL_OUTPUT, max(2_000, tool_out_chars * 3))
+        terminal_out_chars = min(MAX_TERMINAL_OUTPUT, max(1_500, tool_out_chars * 1))
     else:
         tool_out_chars = MAX_READ_BYTES
         listing_count = 200
@@ -1163,60 +1216,8 @@ def make_tool_callbacks(
         terminal_out_chars = MAX_TERMINAL_OUTPUT
     tool_out_chars = min(tool_out_chars, MAX_READ_BYTES)
 
-    async def read_file_tool(path: str) -> str:
-        emit({"kind": "tool", "tool": "read_file", "args": {"path": path}})
-        try:
-            result = read_file(root, path)
-        except PathEscapeError as exc:
-            msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "read_file", "summary": msg})
-            return f"ERROR reading {path}: {msg}"
-        if "error" in result:
-            emit({"kind": "tool_result", "tool": "read_file", "summary": result["error"]})
-            return f"ERROR reading {path}: {result['error']}"
-        body = result["content"]
-        if result.get("truncated"):
-            body += "\n... (file truncated)"
-        if len(body) > tool_out_chars:
-            body = body[:tool_out_chars] + "\n…(output truncated to fit context)"
-        emit({"kind": "tool_result", "tool": "read_file", "summary": f"{len(body)} chars"})
-        return f"FILE {path}\n```\n{body}\n```"
-
-    async def read_lines_tool(path: str, start: int = 1, end: int = -1) -> str:
-        emit({
-            "kind": "tool",
-            "tool": "read_lines",
-            "args": {"path": path, "start": start, "end": end},
-        })
-        try:
-            result = read_lines(root, path, start, end)
-        except PathEscapeError as exc:
-            msg = f"invalid path: {exc}"
-            emit({"kind": "tool_result", "tool": "read_lines", "summary": msg})
-            return f"ERROR reading lines of {path}: {msg}"
-        if "error" in result:
-            msg = result["error"]
-            emit({"kind": "tool_result", "tool": "read_lines", "summary": msg})
-            return f"ERROR reading lines of {path}: {msg}"
-        lines = result.get("lines", [])
-        first = result.get("start")
-        body = "\n".join(
-            f"{first + i}: {ln}" if first is not None else ln
-            for i, ln in enumerate(lines)
-        )
-        if not body:
-            body = "(no lines in requested range)"
-        elif result.get("truncated"):
-            body += "\n…(output truncated to fit context)"
-        emit({
-            "kind": "tool_result",
-            "tool": "read_lines",
-            "summary": f"{len(lines)} lines",
-        })
-        return f"FILE {path} lines {start}..({'end' if (not end or end < 0) else end})\n{body}"
-
     async def write_file_tool(path: str, content: str) -> str:
-        """Replace the ENTIRE file at ``path`` with ``content`` (existing content is overwritten). If the user asks to add to or modify an existing file, first call read_file and write back the full existing content plus your changes."""
+        """Replace the ENTIRE file at ``path`` with ``content`` (existing content is overwritten). Prefer edit_file to modify an existing file; only use this for brand-new files or an explicit full rewrite — you must supply the complete new content yourself since there is no whole-file read tool."""
         emit({"kind": "tool", "tool": "write_file", "args": {"path": path}})
         # Read the previous contents BEFORE writing so we can render an inline
         # diff of what changed for the Code Writer UI.
@@ -1257,7 +1258,7 @@ def make_tool_callbacks(
         return f"Successfully wrote {len(content)} characters to {path}."
 
     async def memory_tool(action: str, subject: str, text: str = "") -> str:
-        """Curate the project's durable memory (stored in .coder/MEMORY.md and loaded into every future session for this project). Keep memory concise and high-value; use replace/remove for stale entries so it never grows large. action must be one of: 'add' (text= new note), 'replace' (subject= text to find, text= new wording for that bullet), 'remove' (subject= text contained in the bullet to delete). Remember ONLY durable, reusable facts: project conventions and how the project works, gotchas and bug fixes that worked, build/test quirks, and preferences the user stated. In ENGLISH. Do NOT store secrets, credentials, personal data, one-off details, or anything already in AGENTS.md. If memory is near its cap, prefer replace/remove over adding."""
+        """Curate the project's durable memory (stored in MEMORY.md at the project root and loaded into every future session for this project). IMPORTANT: if the user explicitly asked you to remember/note/keep something in mind (any language, any phrasing), you MUST call this tool with action='add' in this same turn — replying with words like "I'll remember that" WITHOUT calling this tool saves nothing; the tool call itself is the save. action must be one of: 'add' (text= new note), 'replace' (subject= text to find, text= new wording for that bullet), 'remove' (subject= text contained in the bullet to delete). Beyond explicit requests, also remember durable, reusable facts you learn on your own: project conventions and how the project works, gotchas and bug fixes that worked, build/test quirks, and preferences the user stated. In ENGLISH. Do NOT store secrets, credentials, personal data, one-off details, or anything already in AGENTS.md. If memory is near its cap, prefer replace/remove over adding."""
         emit({"kind": "tool", "tool": "memory", "args": {"action": action, "subject": subject, "text": text}})
         action = (action or "").strip().lower()
         try:
@@ -1289,7 +1290,7 @@ def make_tool_callbacks(
         return f"Memory updated ({action}). It will be loaded automatically in future sessions for this project."
 
     async def search_memory_tool(query: str = "", max_results: int = MEMORY_SEARCH_MAX_RESULTS) -> str:
-        """Search this project's durable memory (.coder/MEMORY.md) for notes relevant to `query`. Memory is NOT pre-loaded into your context anymore (it can hold many notes), so call this to pull in only what's relevant instead of guessing. Use it at the start of non-trivial work, when the request sounds like something covered before, or when stuck on a recurring error — pass a few keywords (e.g. "port config", "auth flow", "test failures"). Leave query empty to see the most recently added notes."""
+        """Search this project's durable memory (MEMORY.md at the project root) for notes relevant to `query`. Memory is NOT pre-loaded into your context anymore (it can hold many notes), so call this to pull in only what's relevant instead of guessing. Use it at the start of non-trivial work, when the request sounds like something covered before, or when stuck on a recurring error — pass a few keywords (e.g. "port config", "auth flow", "test failures"). Leave query empty to see the most recently added notes."""
         emit({"kind": "tool", "tool": "search_memory", "args": {"query": query}})
         try:
             result = search_memory(root, query, max_results)
@@ -1313,6 +1314,31 @@ def make_tool_callbacks(
         body = "\n".join(notes)
         label = f"matching {query!r}" if query else "most recent"
         return f"MEMORY NOTES ({label}, {len(notes)} of {total} total)\n{body}"
+
+    async def update_plan(items: list[dict]) -> str:
+        """Set or update your step-by-step plan for the CURRENT task, shown to the user as a live checklist. Call this FIRST, before touching any files, for any task with 3 or more distinct steps — pass the full list with status='pending' for every item. As you work, call it again with the SAME full list (not just the changed item), updating the step you just finished to 'completed' and the step you're starting to 'in_progress'. Each item needs 'content' (a short imperative phrase, e.g. "Add the edit_file tool") and 'status' (one of 'pending', 'in_progress', 'completed'). Skip this entirely for simple one- or two-step requests — it's for genuinely multi-step work only, and calling it on trivial tasks is noise."""
+        emit({"kind": "tool", "tool": "update_plan", "args": {}})
+        normalized: list[dict] = []
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            content = str(it.get("content", "")).strip()
+            status = str(it.get("status", "pending")).strip().lower()
+            if status not in ("pending", "in_progress", "completed"):
+                status = "pending"
+            if content:
+                normalized.append({"content": content[:200], "status": status})
+        if not normalized:
+            emit({"kind": "tool_result", "tool": "update_plan", "summary": "empty plan"})
+            return "ERROR: plan must contain at least one item with non-empty 'content'."
+        emit({"kind": "plan", "items": normalized})
+        done = sum(1 for i in normalized if i["status"] == "completed")
+        emit({
+            "kind": "tool_result",
+            "tool": "update_plan",
+            "summary": f"{done}/{len(normalized)} done",
+        })
+        return f"Plan updated: {len(normalized)} steps, {done} completed."
 
     async def create_skill_tool(
         name: str, description: str = "", content: str = ""
@@ -1481,6 +1507,10 @@ def make_tool_callbacks(
             msg = f"invalid path: {exc}"
             emit({"kind": "tool_result", "tool": "search_in_files", "summary": msg})
             return f"ERROR searching {path}: {msg}"
+        if result.get("error"):
+            msg = result["error"]
+            emit({"kind": "tool_result", "tool": "search_in_files", "summary": msg})
+            return f"ERROR searching {path}: {msg}"
         matches = result.get("matches", [])
         if not matches:
             emit({"kind": "tool_result", "tool": "search_in_files", "summary": "no matches"})
@@ -1499,12 +1529,12 @@ def make_tool_callbacks(
                     marker = ">" if cl["line"] == m["line"] else " "
                     block.append(f"{m['file']}:{cl['line']}: {marker} {cl['text']}")
             block_size = sum(len(b) + 1 for b in block)
-            if lines and total + block_size > tool_out_chars * 2:
+            if lines and total + block_size > tool_out_chars:
                 break
             lines.extend(block)
             shown += 1
             total += block_size
-            if total >= tool_out_chars * 2:
+            if total >= tool_out_chars:
                 break
         note = (
             f"\n({len(matches)} matches found, {shown} shown)"
@@ -1517,7 +1547,7 @@ def make_tool_callbacks(
     async def terminal_tool(command: str, timeout: int = TERMINAL_TIMEOUT) -> str:
         """Run a shell command in the workspace root and return its output. The command runs with the project folder as the working directory, is killed after `timeout` seconds (default 120), and privileged/system-destructive commands (sudo, rm -rf /, mkfs, reboot, piping into a shell, ...) are blocked. Use this for git, package managers, build/run/lint/test commands and other project operations."""
         emit({"kind": "tool", "tool": "run_terminal", "args": {"command": command}})
-        result = await asyncio.to_thread(run_terminal, root, command, timeout)
+        result = await asyncio.to_thread(run_terminal, root, command, timeout, permit)
         if "error" in result:
             msg = result["error"]
             emit({"kind": "tool_result", "tool": "run_terminal", "summary": msg})
@@ -1552,6 +1582,150 @@ def make_tool_callbacks(
         emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": f"{len(matches)} matches"})
         return f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines) + note
 
+    async def explore_tool(task: str) -> str:
+        """Delegate a broad, read-only investigation to an ISOLATED sub-agent, Claude-Code/opencode style. Use this instead of a long chain of your own list_files/search_in_files/fuzzy_find calls when a question is spread across MANY files or an area you don't know well yet — e.g. 'find where the header layout is defined and how the model badge's state flows into it', or 'find every place that reads or writes chat.mode and how they relate'. The sub-agent runs its OWN search loop in its OWN isolated context: none of ITS intermediate list_files/search_in_files calls or their raw output land in YOUR context — only the short written report below does. This is what actually keeps context usage low on big investigations (a wasted or repeated search inside the sub-agent costs IT context, not you). Pass a clear, SPECIFIC `task` describing exactly what to find and why — the sub-agent has no memory of this conversation, so include any details it needs (e.g. relevant file names or symbols you already know). Do NOT use this for a single file or a location you already know — call search_in_files yourself, it's cheaper for a narrow lookup. The sub-agent has a bounded step budget and may report back partial results if the task was too broad — if that happens, split it into smaller `explore` calls."""
+        emit({"kind": "tool", "tool": "explore", "args": {"task": task}})
+        if summarizer_model is None:
+            emit({"kind": "tool_result", "tool": "explore", "summary": "unavailable"})
+            return "ERROR: explore is unavailable (no model configured for this session)."
+
+        def _sub_emit(event: dict) -> None:
+            # Forward to the same UI stream (so the user sees live sub-agent
+            # activity) but tagged `sub=True` so the PARENT's deterministic
+            # tool-step budget (see agents.py) does not count these steps —
+            # they never enter the parent model's own resent transcript, only
+            # the sub-agent's, which is discarded once explore_tool returns.
+            event = dict(event)
+            event["sub"] = True
+            emit(event)
+
+        async def _sub_list_files(path: str = "") -> str:
+            _sub_emit({"kind": "tool", "tool": "list_files", "args": {"path": path}})
+            try:
+                result = list_files(root, path)
+            except PathEscapeError as exc:
+                msg = f"invalid path: {exc}"
+                _sub_emit({"kind": "tool_result", "tool": "list_files", "summary": msg})
+                return f"ERROR listing {path}: {msg}"
+            if "error" in result:
+                _sub_emit({"kind": "tool_result", "tool": "list_files", "summary": result["error"]})
+                return f"ERROR listing {path}: {result['error']}"
+            lines = []
+            for entry in result["entries"][:listing_count]:
+                marker = "/" if entry["kind"] == "dir" else "  "
+                lines.append(f"{marker}{entry['name']}")
+            if len(result["entries"]) > listing_count:
+                lines.append(f"…({len(result['entries']) - listing_count} more entries)")
+            body = "\n".join(lines) if lines else "(empty directory)"
+            _sub_emit({"kind": "tool_result", "tool": "list_files", "summary": f"{len(result['entries'])} entries"})
+            return f"DIRECTORY {path or '/'}\n{body}"
+
+        async def _sub_search(query: str, path: str = "", context: int = 0) -> str:
+            _sub_emit({"kind": "tool", "tool": "search_in_files", "args": {"query": query, "path": path, "context": context}})
+            try:
+                result = search_in_files(root, query, path, context)
+            except PathEscapeError as exc:
+                msg = f"invalid path: {exc}"
+                _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": msg})
+                return f"ERROR searching {path}: {msg}"
+            if result.get("error"):
+                msg = result["error"]
+                _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": msg})
+                return f"ERROR searching {path}: {msg}"
+            matches = result.get("matches", [])
+            if not matches:
+                _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": "no matches"})
+                return f"No matches for {query!r} under {path or '/'}."
+            lines: list[str] = []
+            total = 0
+            shown = 0
+            for m in matches:
+                if shown >= search_count:
+                    break
+                block = [f"{m['file']}:{m['line']}: {m['text']}"]
+                if m.get("context_lines"):
+                    for cl in m["context_lines"]:
+                        marker = ">" if cl["line"] == m["line"] else " "
+                        block.append(f"{m['file']}:{cl['line']}: {marker} {cl['text']}")
+                block_size = sum(len(b) + 1 for b in block)
+                if lines and total + block_size > tool_out_chars:
+                    break
+                lines.extend(block)
+                shown += 1
+                total += block_size
+                if total >= tool_out_chars:
+                    break
+            note = f"\n({len(matches)} matches found, {shown} shown)" if len(matches) > shown else ""
+            _sub_emit({"kind": "tool_result", "tool": "search_in_files", "summary": f"{len(matches)} matches"})
+            return f"MATCHES for {query!r}\n" + "\n".join(lines) + note
+
+        async def _sub_fuzzy_find(query: str, path: str = "") -> str:
+            _sub_emit({"kind": "tool", "tool": "fuzzy_find", "args": {"query": query, "path": path}})
+            try:
+                result = fuzzy_find_files(root, query, path)
+            except PathEscapeError as exc:
+                msg = f"invalid path: {exc}"
+                _sub_emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": msg})
+                return f"ERROR finding {query!r} under {path or '/'}: {msg}"
+            matches = result.get("matches", [])
+            if not matches:
+                _sub_emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": "no matches"})
+                return f"No files match {query!r} under {path or '/'}."
+            lines = [m["path"] for m in matches[:50]]
+            _sub_emit({"kind": "tool_result", "tool": "fuzzy_find", "summary": f"{len(matches)} matches"})
+            return f"FUZZY MATCHES for {query!r}\n" + "\n".join(lines)
+
+        try:
+            from pydantic_ai import Agent as _Agent, Tool as _Tool
+            from pydantic_ai.settings import ModelSettings as _ModelSettings
+            from pydantic_ai.usage import UsageLimits as _UsageLimits
+            from pydantic_ai.exceptions import UsageLimitExceeded as _UsageLimitExceeded
+            from httpx import Timeout as _Timeout
+
+            sub_agent = _Agent(
+                summarizer_model,
+                system_prompt=(
+                    "You are a read-only exploration sub-agent working inside a desktop IDE's project "
+                    "workspace. You have NO memory of any other conversation — the TASK below is your "
+                    "entire context. Investigate it using list_files, search_in_files and fuzzy_find. Be "
+                    "efficient: combine related searches with regex alternation (foo|bar|baz) instead of "
+                    "separate calls, pass a generous `context` (5-10) on your first search of an area "
+                    "instead of a low-context search followed by a wider one on the same spot, and never "
+                    "repeat a search with only a minor keyword variation over the same area. Stop as soon "
+                    "as you have enough to answer. When done, reply with a CONCISE report (under ~300 "
+                    "words): the exact file paths and line numbers relevant to the task, short code "
+                    "excerpts only where they materially help, and a direct answer to what was asked. Do "
+                    "not pad with commentary or restate the task."
+                ),
+                tools=[
+                    _Tool(_sub_list_files, name="list_files"),
+                    _Tool(_sub_search, name="search_in_files"),
+                    _Tool(_sub_fuzzy_find, name="fuzzy_find"),
+                ],
+                model_settings=_ModelSettings(temperature=0.2, max_tokens=1200),
+            )
+            res = await sub_agent.run(
+                task,
+                usage_limits=_UsageLimits(request_limit=16, tool_calls_limit=30),
+                model_settings=_ModelSettings(timeout=_Timeout(150, connect=15, read=150)),
+            )
+            report = str(getattr(res, "output", "") or "").strip()
+        except _UsageLimitExceeded:
+            emit({"kind": "tool_result", "tool": "explore", "summary": "step budget exceeded"})
+            return (
+                f"EXPLORE for {task!r} did not finish within its step budget — the task was likely too "
+                "broad. Split it into smaller, more specific explore calls, or investigate the remaining "
+                "part yourself with search_in_files."
+            )
+        except Exception as exc:  # noqa: BLE001
+            emit({"kind": "tool_result", "tool": "explore", "summary": f"failed: {exc}"})
+            return f"ERROR: explore sub-agent failed: {exc}"
+        if not report:
+            emit({"kind": "tool_result", "tool": "explore", "summary": "no report"})
+            return f"The exploration sub-agent found nothing usable for {task!r}."
+        emit({"kind": "tool_result", "tool": "explore", "summary": f"{len(report)} chars"})
+        return f"EXPLORE REPORT for {task!r}\n{report}"
+
     async def web_search_tool(query: str, max_results: int = 5) -> str:
         emit({"kind": "tool", "tool": "web_search", "args": {"query": query}})
         result = await asyncio.to_thread(web_search, query, max_results)
@@ -1565,13 +1739,16 @@ def make_tool_callbacks(
             return f"No web results for {query!r}."
         lines = []
         for r in results:
-            lines.append(f"- {r['title']}\n  {r['url']}\n  {r['snippet']}")
+            snippet = r["snippet"]
+            if len(snippet) > WEB_SEARCH_SNIPPET_MAX:
+                snippet = snippet[:WEB_SEARCH_SNIPPET_MAX] + " …"
+            lines.append(f"- {r['title']}\n  {r['url']}\n  {snippet}")
         emit({"kind": "tool_result", "tool": "web_search", "summary": f"{len(results)} results"})
         return f"WEB RESULTS for {query!r}\n" + "\n".join(lines)
 
-    async def fetch_url_tool(url: str, max_chars: int = 6000) -> str:
+    async def fetch_url_tool(url: str, question: str = "") -> str:
         emit({"kind": "tool", "tool": "fetch_url", "args": {"url": url}})
-        result = await asyncio.to_thread(fetch_url, url, max_chars)
+        result = await asyncio.to_thread(fetch_url, url)
         if "error" in result:
             msg = result["error"]
             emit({"kind": "tool_result", "tool": "fetch_url", "summary": msg})
@@ -1583,16 +1760,85 @@ def make_tool_callbacks(
             "tool": "fetch_url",
             "summary": f"{len(body)} chars",
         })
+
+        # Claude-Code-style: the main model receives only a distilled answer,
+        # not the raw page. A summarizer model (the same configured model, run
+        # with a tiny token budget) answers the `question` from the extracted
+        # text, keeping the main context lean.
+        answer = ""
+        if summarizer_model is not None:
+            try:
+                from pydantic_ai import Agent
+                from pydantic_ai.settings import ModelSettings
+                from httpx import Timeout
+
+                summarizer = Agent(
+                    summarizer_model,
+                    system_prompt=(
+                        "You are a web-page reader. Read the quoted page text and "
+                        "answer the user's question with a CONCISE summary (under "
+                        "120 words). If the page cannot answer the question, say "
+                        "so. Ignore navigation menus, sidebars, footers and "
+                        "ads."
+                    ),
+                    model_settings=ModelSettings(temperature=0.2, max_tokens=400),
+                )
+                _prompt = question.strip() or "Summarize the key content of this page."
+                res = await summarizer.run(
+                    f"QUESTION: {_prompt}\n\nPAGE TEXT:\n{body}",
+                    model_settings=ModelSettings(
+                        timeout=Timeout(90, connect=15, read=90)
+                    ),
+                )
+                answer = str(getattr(res, "output", "") or "").strip()
+            except Exception:  # noqa: BLE001
+                answer = ""  # summarizer failed; fall through to excerpt
+
         head = f"PAGE {url}\n" + (f"TITLE: {title}\n" if title else "")
+        if answer:
+            return head + "SUMMARY:\n" + answer
+        # Fallback: no summarizer (or it failed) — return a bounded excerpt that
+        # respects the shared context budget so it can never overflow the window.
+        if len(body) > tool_out_chars:
+            body = body[:tool_out_chars] + "\n…(output truncated to fit context)"
         return head + body
 
+    async def request_permission_tool(action: str, path: str = "", reason: str = "") -> str:
+        """Request the user's permission to read, search or act OUTSIDE the current workspace root. BEFORE touching anything outside the project folder (e.g. ~/.config, /Users/..., $HOME files, system paths), call this and WAIT for the result. If it returns PERMISSION GRANTED you may proceed with that outside action; if PERMISSION DENIED you MUST NOT access it — instead explain to the user what you needed and why, and continue with what is possible inside the workspace. `action` is a short phrase like 'read config', 'run command', 'inspect file'."""
+        emit({"kind": "tool", "tool": "request_permission", "args": {"action": action, "path": path}})
+        if permission_gates is None:
+            return "ERROR: permission system is not available."
+        pid = f"p{uuid.uuid4().hex[:8]}"
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        permission_gates[pid] = fut
+        emit({"kind": "permission", "id": pid, "action": action, "path": path, "reason": reason})
+        try:
+            granted = await asyncio.wait_for(fut, timeout=300)
+        except asyncio.TimeoutError:
+            granted = False
+        finally:
+            permission_gates.pop(pid, None)
+        if granted:
+            if permit is not None:
+                permit["outside"] = True
+            return (
+                f"PERMISSION GRANTED for {path or action!r}. The user approved it — you may now "
+                f"complete this outside-workspace action (other outside actions still need a fresh "
+                f"permission)."
+            )
+        return (
+            f"PERMISSION DENIED for {path or action!r}. Do NOT access anything outside the workspace. "
+            f"Tell the user what you needed and why, then continue with what you can do inside."
+        )
+
     return {
-        "read_file": read_file_tool,
-        "read_lines": read_lines_tool,
+        "request_permission": request_permission_tool,
         "write_file": write_file_tool,
         "edit_file": edit_file_tool,
         "memory": memory_tool,
         "search_memory": search_memory_tool,
+        "update_plan": update_plan,
         "create_skill": create_skill_tool,
         "create_mcp": create_mcp_tool,
         "list_files": list_files_tool,

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getActiveProvider, useStore, DEFAULT_MAX_HISTORY } from "../lib/store";
-import { streamChat, fetchModels, transcribeAudio } from "../lib/api";
+import { streamChat, fetchModels, transcribeAudio, respondPermission } from "../lib/api";
 import { api, workspaceSkills, type WorkspaceSkill } from "../lib/fs";
 import {
   contextPercent,
@@ -8,9 +8,10 @@ import {
   formatTokens,
 } from "../lib/context";
 import { supportsReasoning } from "../lib/thinking";
-import type { ChatMessage, SidecarEvent, ToolActivity } from "../types";
+import { allModes, getMode } from "../lib/modes";
+import type { AgentMode, ChatMessage, SidecarEvent, ToolActivity } from "../types";
 import { ChatMessageView } from "./ChatMessage";
-import { ModeToggle } from "./ModeToggle";
+import { ModeSelect } from "./ModeSelect";
 
 const PROVIDER_LABELS: Record<string, string> = {
   opencode: "opencode",
@@ -20,15 +21,14 @@ const PROVIDER_LABELS: Record<string, string> = {
 };
 
 const COMMANDS: Array<{ name: string; hint: string }> = [
+  { name: "help", hint: "List all commands" },
   { name: "compact", hint: "Summarize & compact the chat context" },
   { name: "clear", hint: "Clear all messages in this chat" },
   { name: "new", hint: "Start a new chat" },
   { name: "undo", hint: "Undo the last user/assistant exchange" },
   { name: "redo", hint: "Redo the last undone exchange" },
-  { name: "dir", hint: "Toggle RTL / LTR" },
-  { name: "workspace", hint: "Show this chat's workspace path" },
-  { name: "skills", hint: "Add skills / MCP tools to this message" },
-  { name: "help", hint: "List all commands" },
+  { name: "skill", hint: "Create a skill (describe what you want after the command)" },
+  { name: "mcp", hint: "Create an MCP connector (describe what you want after the command)" },
 ];
 
 const IMAGE_EXTS = new Set([
@@ -62,7 +62,7 @@ function sliceToBudget(
   // Model-scale the history char budget so small-context models (8k) get a tiny
   // slice, mirroring the backend's own trimmer.
   const ctx = contextWindow && contextWindow > 0 ? contextWindow : 32000;
-  const budget = Math.floor(ctx * 4 * 0.5); // chars
+  const budget = Math.floor(ctx * 1.5); // chars (~37% of window at 4 chars/token); mirrors the backend's conservative history share
   const capped = history.slice(-maxHistory);
   const kept: typeof history = [];
   let acc = 0;
@@ -86,9 +86,19 @@ export function ChatPanel() {
   const root = useStore((s) => s.root);
   const dir = useStore((s) => s.dir);
   const toggleDir = useStore((s) => s.toggleDir);
+  const settings = useStore((s) => s.settings);
+  const modes = useStore((s) => allModes(s.settings));
   const maxHistory = provider.maxHistory ?? DEFAULT_MAX_HISTORY;
+  const nvimFile = useStore((s) => s.nvimFile);
 
   const wroot = chat?.root || root;
+  const nvimRel = useMemo(() => {
+    if (!nvimFile || !wroot) return null;
+    return relFromRoot(wroot, nvimFile);
+  }, [nvimFile, wroot]);
+  // The label always shows when a Neovim file is detected; outside the workspace
+  // we display the absolute path (it just can't be mentioned to the agent).
+  const nvimLabel = nvimFile ? (nvimRel || nvimFile) : null;
   const systemPrompt = useStore((s) =>
     chat ? (s.settings.systemPrompts?.[chat.mode] ?? "") : "",
   );
@@ -118,6 +128,12 @@ export function ChatPanel() {
     Array<{ kind: "skill" | "mcp"; name: string; path?: string }>
   >(chat?.draft?.skillChips ?? []);
   const [wsSkills, setWsSkills] = useState<WorkspaceSkill[]>([]);
+  const [permissionReq, setPermissionReq] = useState<{
+    id: string;
+    action: string;
+    path?: string;
+    reason?: string;
+  } | null>(null);
   const mcpConnectors = useStore((s) => s.settings.mcpServers ?? {});
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -125,11 +141,51 @@ export function ChatPanel() {
   const abortRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastEventAt = useRef(0);
+  /** Whether the open Neovim file is selected to be mentioned on the next send. */
+  const [nvimMentioned, setNvimMentioned] = useState(false);
+  /** Transient confirmation shown when the user switches the chat's mode. */
+  const [modeNotice, setModeNotice] = useState<string | null>(null);
+
+  // Switch the CURRENT chat's mode and confirm it visibly (so it's obvious the
+  // change applies to this chat's next message, not a new chat).
+  const changeMode = (mode: AgentMode) => {
+    if (!chat) return;
+    useStore.getState().setChatMode(chat.id, mode);
+    const def = getMode(settings, mode);
+    setModeNotice(`Mode changed to ${def.label} — your next message runs in this mode.`);
+  };
+
+  useEffect(() => {
+    if (!modeNotice) return;
+    const t = setTimeout(() => setModeNotice(null), 3500);
+    return () => clearTimeout(t);
+  }, [modeNotice]);
 
   useEffect(() => {
     window.coder
       .getSidecarUrl()
       .then((url) => setSidecarStatus(url ? "ok" : "fail"));
+  }, []);
+
+  // Track the file currently open in Neovim (fed by the main-process watcher,
+  // which queries the nvim RPC socket). Only the path is stored here; the label
+  // is shown automatically and the file is sent to the agent only when the user
+  // explicitly clicks/selects it for that message.
+  useEffect(() => {
+    let cancelled = false;
+    window.coder
+      .getNvimFile()
+      .then((abs) => {
+        if (!cancelled) useStore.getState().setNvimFile(abs);
+      })
+      .catch(() => undefined);
+    const unsub = window.coder.onNvimFile((f) => {
+      if (!cancelled) useStore.getState().setNvimFile(f.abs);
+    });
+    return () => {
+      cancelled = true;
+      unsub();
+    };
   }, []);
 
   // Keep the pending composer state (input text + chips) scoped to THIS chat by
@@ -202,8 +258,10 @@ export function ChatPanel() {
   useEffect(() => {
     const onToggleMode = () => {
       if (chat) {
-        const next = chat.mode === "chat" ? "codewriter" : "chat";
-        useStore.getState().setChatMode(chat.id, next);
+        const ids = allModes(useStore.getState().settings).map((m) => m.id);
+        const idx = ids.indexOf(chat.mode);
+        const next = ids[(idx + 1) % ids.length] ?? "ask";
+        changeMode(next);
       }
     };
     const onAttachFile = (e: Event) => {
@@ -272,6 +330,7 @@ const contextUsed = useMemo(() => {
     text: string,
     atts: string[] = [],
     imgs: Array<{ path: string; name: string }> = [],
+    allowCreate = false,
   ) => {
     const s = useStore.getState();
     const chat = s.chats.find((c) => c.id === s.activeChatId);
@@ -423,6 +482,18 @@ const contextUsed = useMemo(() => {
         store.updateMessage(assistantMsg.id, {
           content: base ? `${base}\n> *${event.content ?? ""}*` : `> *${event.content ?? ""}*\n`,
         });
+      } else if (event.kind === "plan") {
+        store.updateMessage(assistantMsg.id, {
+          plan: event.items ?? [],
+          retry: null,
+        });
+      } else if (event.kind === "permission") {
+        setPermissionReq({
+          id: event.id ?? "",
+          action: event.action ?? "",
+          path: event.path,
+          reason: event.reason,
+        });
       } else if (event.kind === "error") {
         store.updateMessage(assistantMsg.id, {
           content:
@@ -470,6 +541,10 @@ const contextUsed = useMemo(() => {
             return sel;
           })(),
           skills: skillChips.filter((c) => c.kind === "skill").map((c) => c.name),
+          allowCreate,
+          cap: getMode(s.settings, chat.mode).capabilities,
+          allowOutside: s.outsideAllowed,
+          nvimFile: nvimMentioned ? nvimRel || undefined : undefined,
           signal: abort.signal,
         },
         handleEvent,
@@ -483,6 +558,7 @@ const contextUsed = useMemo(() => {
       setStalled(false);
       setBusy(false);
       abortRef.current = null;
+      setNvimMentioned(false);
       useStore.getState().setStreaming(false, false);
       useStore.getState().updateMessage(assistantMsg.id, { streaming: false });
     }
@@ -513,10 +589,11 @@ const contextUsed = useMemo(() => {
         {
           provider: getActiveProvider(),
           root: rootDir,
-          mode: "chat",
+          mode: ch.mode,
           prompt,
           history: [],
-          systemPrompt: s.settings.systemPrompts?.chat ?? "",
+          systemPrompt: s.settings.systemPrompts?.[ch.mode] ?? "",
+          cap: getMode(s.settings, ch.mode).capabilities,
           mcpServers: s.settings.mcpServers ?? {},
         },
         (ev) => {
@@ -550,9 +627,6 @@ const contextUsed = useMemo(() => {
       case "/new":
         s.newChat(ch?.mode);
         break;
-      case "/dir":
-        s.toggleDir();
-        break;
       case "/undo":
         if (ch && s.undoMessage()) {
           s.addMessage({ role: "assistant", content: "↩ Undone." });
@@ -567,14 +641,6 @@ const contextUsed = useMemo(() => {
           s.addMessage({ role: "assistant", content: "Nothing to redo." });
         }
         break;
-      case "/workspace":
-        if (ch) {
-          s.addMessage({
-            role: "assistant",
-            content: `Current workspace:\n\n\`${ch.root || s.root || "(none — press ⌘O to open a folder)"}\``,
-          });
-        }
-        break;
       case "/help":
         s.addMessage({
           role: "assistant",
@@ -583,6 +649,34 @@ const contextUsed = useMemo(() => {
             COMMANDS.map((c) => `- \`/${c.name}\` — ${c.hint}`).join("\n"),
         });
         break;
+      case "/skill":
+      case "/mcp": {
+        const target = word === "/skill" ? "skill" : "MCP connector";
+        const rest = v.slice(word.length).trim();
+        if (!rest) {
+          s.addMessage({
+            role: "assistant",
+            content:
+              word === "/skill"
+                ? `Usage: \`/skill <description>\` — describe the skill you want after the command, e.g. \`/skill summarize a project's git log into release notes\`.`
+                : `Usage: \`/mcp <description>\` — describe the tool/connector you want after the command, e.g. \`/mcp a way to search YouTube\`.`,
+          });
+          return;
+        }
+        s.addMessage({
+          role: "user",
+          content: v,
+        });
+        void send(
+          target === "skill"
+            ? `Create a new skill from this description: "${rest}". Use the create_skill tool to set it up with a good its name/slug and the instructions. Ask me only for anything essential that is genuinely missing; otherwise just create it. Do not modify files outside creating this skill.`
+            : `Create a new MCP connector from this description: "${rest}". Use the create_mcp tool to add it, choosing a good name and command/URL/config that fits the description. Ask me only for anything essential that is genuinely missing; otherwise just create it. Do not modify files for this.`,
+          [],
+          [],
+          true,
+        );
+        break;
+      }
       default:
         s.addMessage({
           role: "assistant",
@@ -617,6 +711,7 @@ const contextUsed = useMemo(() => {
     setCmdOpen(null);
     const atts = attachments;
     const imgs = images;
+    setImages([]);
     void send(v, atts, imgs);
   };
 
@@ -782,12 +877,6 @@ const contextUsed = useMemo(() => {
 
   const acceptCmd = (name: string) => {
     if (!cmdOpen) return;
-    if (name === "skills") {
-      setCmdOpen(null);
-      void openSkillPicker();
-      requestAnimationFrame(() => textareaRef.current?.focus());
-      return;
-    }
     const before = input.slice(0, cmdOpen.at);
     const after = input.slice(cmdOpen.at + 1 + cmdQuery.length);
     const next = `${before}/${name} ${after}`;
@@ -922,10 +1011,6 @@ const contextUsed = useMemo(() => {
   return (
     <div className="chat-panel">
       <div className="chat-toolbar">
-        <ModeToggle
-          mode={chat.mode}
-          onChange={(mode) => useStore.getState().setChatMode(chat.id, mode)}
-        />
         <button
           className="dir-toggle"
           onClick={toggleDir}
@@ -963,6 +1048,11 @@ const contextUsed = useMemo(() => {
             gap: 6,
           }}
         >
+          <ModeSelect
+            modes={modes}
+            value={chat.mode}
+            onChange={changeMode}
+          />
           <span
             className={`status-dot ${sidecarStatus}`}
             title={
@@ -985,14 +1075,8 @@ const contextUsed = useMemo(() => {
         <div className="chat-messages" data-dir={dir}>
           {chat.messages.length === 0 && (
             <div className="empty-state">
-              <h2>
-                {chat.mode === "codewriter" ? "Code Writer mode" : "Chat mode"}
-              </h2>
-              <p>
-                {chat.mode === "codewriter"
-                  ? "Describe a feature or task. I will read your project, write files, and run terminal commands."
-                  : "Ask anything about your project. I can read, search and fetch the web, and install skills or MCP connectors. To edit files or run commands, switch to Code Writer mode."}
-              </p>
+              <h2>{getMode(settings, chat.mode).label} mode</h2>
+              <p>{getMode(settings, chat.mode).description}</p>
             </div>
           )}
           {chat.messages.map((m: ChatMessage) => (
@@ -1025,6 +1109,9 @@ const contextUsed = useMemo(() => {
         <div className="composer-inner">
           {dragOver && (
             <div className="drop-overlay">Drop files or images to attach</div>
+          )}
+          {modeNotice && (
+            <div className="mode-notice" dir="ltr">{modeNotice}</div>
           )}
           <div className="composer-input-wrap">
             {cmdOpen && (
@@ -1126,6 +1213,24 @@ const contextUsed = useMemo(() => {
             />
           </div>
 
+          {nvimLabel && (
+            <button
+              type="button"
+              className={`nvim-label${nvimMentioned ? " selected" : ""}`}
+              dir="ltr"
+              title={
+                nvimMentioned
+                  ? "Will be mentioned in your next message — click to deselect"
+                  : `Open in Neovim: ${nvimFile} — click to mention in your next message`
+              }
+              onClick={() => setNvimMentioned((m) => !m)}
+            >
+              <span className="nvim-glyph">nvim</span>
+              <span className="nvim-file">{nvimLabel}</span>
+              <span className="nvim-check">{nvimMentioned ? "✓" : "+"}</span>
+            </button>
+          )}
+
           {(attachments.length > 0 || images.length > 0 || skillChips.length > 0) && (
             <div className="attachment-chips" dir="ltr">
               {skillChips.map((c) => (
@@ -1173,6 +1278,14 @@ const contextUsed = useMemo(() => {
           )}
 
           <div className="composer-row">
+            <span className="composer-left">
+              <ModeSelect
+                modes={modes}
+                value={chat.mode}
+                iconOnly
+                onChange={changeMode}
+              />
+            </span>
             <span className="composer-hint">
               {busy && (
                 <span className={`composer-working${stalled ? " warn" : ""}`}>
@@ -1318,6 +1431,58 @@ const contextUsed = useMemo(() => {
           </div>
         </div>
       </div>
+      {permissionReq && (
+        <div className="perm-overlay">
+          <div className="perm-dialog">
+            <div className="perm-dialog-title">Outside workspace access</div>
+            <div className="perm-dialog-action">
+              {permissionReq.action}
+              {permissionReq.path ? (
+                <code className="perm-dialog-path">{permissionReq.path}</code>
+              ) : null}
+            </div>
+            {permissionReq.reason ? (
+              <div className="perm-dialog-reason">{permissionReq.reason}</div>
+            ) : null}
+            <div className="perm-dialog-note">
+              This lets the agent work outside your current workspace.
+            </div>
+            <div className="perm-dialog-buttons">
+              <button
+                type="button"
+                className="btn perm-deny"
+                onClick={() => {
+                  void respondPermission(permissionReq.id, false);
+                  setPermissionReq(null);
+                }}
+              >
+                Deny
+              </button>
+              <button
+                type="button"
+                className="btn perm-allow"
+                onClick={() => {
+                  void respondPermission(permissionReq.id, true);
+                  setPermissionReq(null);
+                }}
+              >
+                Allow once
+              </button>
+              <button
+                type="button"
+                className="btn perm-allow-always"
+                onClick={() => {
+                  void respondPermission(permissionReq.id, true);
+                  useStore.getState().setOutsideAllowed(true);
+                  setPermissionReq(null);
+                }}
+              >
+                Always allow
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

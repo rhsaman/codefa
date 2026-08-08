@@ -49,6 +49,12 @@ const api = {
   getPathForFile: (file: File): string => webUtils.getPathForFile(file),
   storeGet: <T>(key: string): Promise<T | null> => ipcRenderer.invoke('store:get', key),
   storeSet: (key: string, value: unknown): Promise<boolean> => ipcRenderer.invoke('store:set', key, value),
+  getNvimFile: (): Promise<string | null> => ipcRenderer.invoke('nvim:get'),
+  onNvimFile: (cb: (f: { abs: string | null }) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, f: { abs: string | null }): void => cb(f)
+    ipcRenderer.on('nvim:file', listener)
+    return () => ipcRenderer.removeListener('nvim:file', listener)
+  },
 }
 
 contextBridge.exposeInMainWorld('coder', api)

@@ -13,8 +13,13 @@ import ast
 import json
 import os
 import re
+import traceback
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+# Pending permission requests: id -> asyncio.Future. Resolved by the
+# /permission/respond endpoint and awaited by the agent's request_permission tool.
+PERMISSION_GATES: dict[str, asyncio.Future] = {}
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,6 +56,16 @@ class ChatRequest(BaseModel):
     mcp_servers: dict = {}
     context_window: int = 0
     skills: list[str] = []
+    allow_create: bool = False
+    # Mode capabilities: tool access per mode, so the backend can gate tools
+    # data-driven instead of hardcoding mode names. Optional for backward compat.
+    cap: dict = {}
+    # User pre-approved outside-workspace access for this session (workspace).
+    allow_outside: bool = False
+    # Absolute path of the file currently open in Neovim (auto-mentioned unless
+    # the user disabled it). Resolved against the workspace root; ignored if it
+    # escapes the root or the auto-mention is off.
+    nvim_file: str = ""
 
 
 class ModelsRequest(BaseModel):
@@ -58,6 +73,21 @@ class ModelsRequest(BaseModel):
     api_key: str = ""
     env_var: str = ""
     base_url: str = ""
+
+
+class PermissionResponse(BaseModel):
+    id: str
+    allowed: bool
+
+
+@app.post("/permission/respond")
+async def permission_respond(req: PermissionResponse) -> dict:
+    """Resolve a pending outside-workspace permission request from the agent."""
+    fut = PERMISSION_GATES.pop(req.id, None)
+    if fut is None or fut.done():
+        return {"status": "missing"}
+    fut.set_result(req.allowed)
+    return {"status": "ok"}
 
 
 @app.get("/health")
@@ -161,11 +191,28 @@ def _friendly_error(exc: Exception, model: str) -> str:
     if detail:
         text = detail
     low = text.lower()
-    if "429" in low or "rate limit" in low or "freeusagelimit" in low or "quota" in low:
+    if "output retries" in low or "return text or call a tool" in low or "unexpectedmodelbehavior" in low:
         text += (
-            "\n\nThis looks like a provider rate/usage limit (the default 'deepseek-v4-flash-free' "
-            "model on the opencode gateway limits requests per minute). Wait ~30s and retry, or "
-            "switch to a paid/local model in Settings for uninterrupted long tasks."
+            "\n\nThe model returned no usable reply (empty or invalid response). This model/provider"
+            " is unreliable for this turn — switch model in Settings and retry."
+        )
+    elif "unknown variant" in low and "image_url" in low:
+        text += (
+            "\n\nThe selected model does not support image/batch attachments (it rejects image"
+            " content, only accepting text). Screenshots and attached images were ignored for"
+            " this turn — switch to a vision-capable model in Settings to send them."
+        )
+    elif "429" in low or "rate limit" in low or "freeusagelimit" in low or "quota" in low or "request limit reached" in low or "resource exhausted" in low or "worker local" in low or "upstream error" in low:
+        text += (
+            "\n\nThis is a provider rate/request limit (the upstream is throttling or at "
+            "capacity right now — e.g. 'ResourceExhausted: Worker local total request "
+            "limit reached'). Wait ~30s and retry, or switch to another model in Settings."
+        )
+    elif "capacity" in low or "ttft" in low or "all providers" in low or "overloaded" in low:
+        text += (
+            "\n\nAll upstream providers for this model are temporarily at capacity (free tiers are "
+            "routed to a small pool that fills fast). Wait a moment and retry, or switch to a "
+            "another model in Settings."
         )
     elif ("context" in low or "context_length" in low or "token" in low) and any(
         w in low
@@ -187,6 +234,13 @@ def _friendly_error(exc: Exception, model: str) -> str:
             "\n\nThe conversation is too long for this model's context window. "
             "Use /compact to summarize it (or start a new chat with /new), then retry."
         )
+    elif "tool-loop step budget" in low or "compacting earlier turns" in low:
+        text += (
+            "\n\nThis task needed more tool calls (file searches, edits, etc.) than the safety "
+            "budget allows, even after the budget was raised and the conversation was compacted "
+            "automatically. Try breaking the request into smaller steps, or continue by asking to "
+            "pick up where it left off."
+        )
     elif "403" in low or "access denied" in low or "security policy" in low:
         text += (
             "\n\nThis looks like an OpenRouter gateway block (some regions/keys can't reach it). "
@@ -207,7 +261,10 @@ def _friendly_error(exc: Exception, model: str) -> str:
             "pick a valid model for the selected provider, or check your API key/base URL."
         )
     else:
-        text += "\n\nCheck your API key and provider settings in Settings."
+        text += (
+            "\n\nUnexpected provider error. Wait a moment and retry; if it persists, "
+            "verify your API key and provider settings in Settings."
+        )
     return text[:2000]
 
 
@@ -237,6 +294,11 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 mcp_servers=req.mcp_servers,
                 context_window=req.context_window,
                 skills_selected=req.skills,
+                allow_create=req.allow_create,
+                cap=req.cap,
+                permission_gates=PERMISSION_GATES,
+                allow_outside=req.allow_outside,
+                nvim_file=req.nvim_file,
             ):
                 # --- بخش اصلاح شده برای جلوگیری از خطای AttributeError ---
                 # ابتدا چک می‌کنیم آیا event یک دیکشنری است یا یک شیء
@@ -270,7 +332,10 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             # finally block, so just stop iterating cleanly.
             raise
         except Exception as exc:
-            # استفاده از _friendly_error که قبلاً تعریف شده
+            # Full traceback to the sidecar stderr so an opaque upstream message
+            # ("Exceeded maximum output retries (1)", ...) never hides the real
+            # trigger; the user still sees a readable error over SSE.
+            traceback.print_exc()
             yield _sse({"kind": "error", "content": _friendly_error(exc, req.model)})
         finally:
             # ارسال سیگنال پایان برای بستن استریم در فرانت‌اند

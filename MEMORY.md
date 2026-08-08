@@ -1,0 +1,32 @@
+# Agent Memory
+
+## Important Notes
+- [2026-08-07] The project offers two chat modes: a general Chat mode and a Code Writer mode.
+- [2026-08-07] Users can switch between these modes using the shortcut Cmd/Ctrl+M or via the UI toggle.
+- [2026-08-07] The project supports two chat modes: **Chat** (conversational assistant) and **Code Writer** (automatic code generation).
+- [2026-08-07] Project has 3 built-in chat modes: Ask, Plan, Coder, defined in `src/lib/modes.ts`; system prompts live in `backend/agents.py` under `SYSTEM_PROMPTS` keys `ask`, `plan`, `coder`. Custom modes are supported via `allModes()`.
+- [2026-08-07] `README.md` is outdated: it still references old names "Chat" and "Code Writer" instead of the current Ask/Plan/Coder registry.
+- [2026-08-07] The project uses `react-markdown` for rendering Markdown content in an Electron desktop app, which fails to render HTML tables correctly, displaying them as text or code blocks instead.
+- [2026-08-07] The recommended solution is to replace `react-markdown` with the `react-markdown-table` library to ensure proper table rendering within the Electron environment.
+- [2026-08-07] Codefa is a desktop AI coding assistant built with Electron (main), React/Vite/TypeScript (renderer), and a Python FastAPI sidecar (backend) using Pydantic AI for agent logic and tool use.
+- [2026-08-07] Key conventions: sandboxed workspace via user-selected root folder; SSE streaming for live token/tool output; BYOM (OpenRouter, Ollama, OpenAI-compatible, llama.cpp, vLLM); local Whisper for voice input; MCP support; history persisted to `~/.coder/`; Zustand for frontend state; IPC bridge for secure file-system access.
+- [2026-08-08] FIXED context bug in `backend/agents.py`: the deterministic tool-loop budget (`_TOOL_STEPS_COMPACT_AT = 24`) fired after just 24 tool steps and raised a FABRICATED "Context nearly full (700000 of 1000000 tokens)" for 1M-window models (deepseek-v4-flash), even when real usage was ~20k tokens; after compacting, the retry hit 24 steps again and hard-errored. Now: adaptive `_preemptive_compact_fraction(ctx)` (0.70 ≤16k → 0.95 >256k), adaptive `_tool_steps_compact_at(ctx)` (24 small → 250 for 1M), `_HighWatermark` carries an honest `note` (no fake token counts), and repeated step-budget hits after a compact widen the cap and retry instead of failing.
+- [2026-08-07] Project defines three agent modes in `src/lib/modes.ts`: `ask` (read-only), `plan` (read-only + read-only terminal), `coder` (full access)
+- [2026-08-07] Active mode stored in `store.ts` as `AgentMode`; switched via `Cmd/Ctrl+M`; backend prompts differ per mode, frontend only sends capabilities for tool gating
+- [2026-08-07] Project has two read-only agent modes: `ask` (passive Q&A/research) and `plan` (can run read-only terminal commands like `git diff`, `rg`, `find` for codebase exploration)
+- [2026-08-07] Both modes have `writeFiles: false`; key difference is `plan` allows terminal execution for analysis; user switches via `Cmd/Ctrl+M` or chat menu; system prompts defined in backend (Python/Pydantic AI)
+- [2026-08-07] Markdown tables were rendering as raw text because `fixMixedText` in `src/lib/bidi.ts` injected Unicode directional isolates (U+2068/U+2069) into table rows, breaking the markdown parser. Fixed by
+- [2026-08-07] Table rendering fixed via `remark-gfm` + `prepareContent` skip; styling includes borders, zebra striping, sticky headers, RTL (`direction: auto`), and horizontal scroll with custom scrollbar
+- [2026-08-07] Changes to `ChatMessage.tsx` require dev server restart (`npm run dev`) to take effect
+- [2026-08-07] Table rendering fixed by skipping `fixMixedText` for all table rows (header, separator, data) in `src/components/ChatMessage.tsx` to prevent invisible Unicode direction chars from breaking `remark-gfm` parsing.
+- [2026-08-07] `src/styles/global.css` already contains complete table styling: borders, padding, dark header, zebra striping, horizontal scroll with custom scrollbar, sticky headers, and fallback for tables without `<thead>`/`<tbody>`.
+- [2026-08-07] Project: Codefa —
+- [2026-08-07] Plan mode is read-only: can explore codebase, run read-only commands, search, and create plans with exact file paths and code snippets, but cannot write, edit, create, or delete files
+- [2026-08-07] Only Coder mode permits writing and editing files
+- [2026-08-07] The project distinguishes two coaching modes: **Ask mode** for teaching, explaining code, answering conceptual questions; **Plan mode** for designing features, planning refactors, debugging, and producing executable implementation plans. Choose based on the immediate goal.
+- [2026-08-07] Project uses two distinct AI modes: **Plan mode** (architect/planner — explores codebase, designs changes, outputs structural plans for Coder mode) and **Ask mode** (coach/mentor — explains architecture, answers questions, teaches, does educational code review). User is currently in Plan mode.
+- [2026-08-07] Project: **Codefa** — Electron desktop app with React/Vite frontend, Python/FastAPI sidecar backend, Monaco Editor, Zustand state management
+- [2026-08-07] Current session mode: **Plan mode (read-only)** — can explore/search, cannot write/edit/delete files
+- [2026-08-07] Project: Codefa — Electron app with Pydantic AI sidecar architecture
+- [2026-08-07] Assistant mode (Plan vs Ask) is fixed per conversation by the client; cannot switch mid-chat — start a new chat with the desired mode
+- [2026-08-07] The assistant mode (Plan/Ask/Coder) is fixed at conversation invocation by the client (Cursor/Claude Code) and cannot be switched mid-chat; a new chat must be started to change modes.

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type {
   AgentMode,
+  AgentModeDef,
   Chat,
   ChatDraft,
   ChatMessage,
@@ -8,10 +9,26 @@ import type {
   ProviderConfig,
   ProviderKind,
   Settings,
+  Workspace,
 } from '../types'
 import { api, workspaceMcp } from './fs'
+import { BUILTIN_IDS, normalizeMode } from './modes'
 
 const uid = (): string => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+
+/** Map legacy prompt keys from before the modes registry onto current ids. */
+function migrateModePrompts(prompts: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = { ...prompts }
+  if ('chat' in out && !('ask' in out)) {
+    out.ask = out.chat
+    delete out.chat
+  }
+  if ('codewriter' in out && !('coder' in out)) {
+    out.coder = out.codewriter
+    delete out.codewriter
+  }
+  return out
+}
 
 let persistTimer: ReturnType<typeof setTimeout> | undefined
 function persistSoon(): void {
@@ -31,7 +48,7 @@ function stackFor(chatId: string): { undo: ChatMessage[][]; redo: ChatMessage[][
   return st
 }
 
-export const DEFAULT_MAX_HISTORY = 20
+export const DEFAULT_MAX_HISTORY = 10
 
 export const PROVIDER_NAMES: Record<ProviderKind, string> = {
   opencode: 'opencode',
@@ -116,11 +133,14 @@ interface State {
   sidebarOpen: boolean
   workspaceColors: Record<string, string>
   pinnedWorkspaces: string[]
+  workspaces: Workspace[]
   chats: Chat[]
   activeChatId: string
   settingsOpen: boolean
   isStreaming: boolean
   isThinking: boolean
+  /** Session-scoped "allow outside-workspace" (reset when the root changes). */
+  outsideAllowed: boolean
 
   load: () => Promise<void>
   persist: () => void
@@ -137,7 +157,10 @@ interface State {
   addMcpServer: (name: string, cfg: McpServerConfig) => void
   updateMcpServer: (name: string, cfg: McpServerConfig) => void
   removeMcpServer: (name: string) => void
-  setSystemPrompt: (mode: 'chat' | 'codewriter', text: string) => void
+  setSystemPrompt: (mode: AgentMode, text: string) => void
+  /** Upsert a user-created mode def; kept separate from built-ins. */
+  upsertMode: (def: AgentModeDef) => void
+  removeMode: (id: AgentMode) => void
   setRecentModels: (recentModels: string[]) => void
   addRecentModel: (model: string) => void
   setRoot: (root: string) => void
@@ -153,6 +176,8 @@ interface State {
 
   newChat: (mode?: AgentMode) => string
   newChatInRoot: (root: string, mode?: AgentMode) => string
+  createWorkspace: (root: string) => string
+  setWorkspaceOrder: (keys: string[]) => void
   deleteChat: (id: string) => void
   deleteWorkspace: (key: string) => void
   setWorkspaceColor: (key: string, color: string) => void
@@ -173,9 +198,13 @@ interface State {
 
   setSettingsOpen: (open: boolean) => void
   setStreaming: (active: boolean, thinking: boolean) => void
+  setOutsideAllowed: (allowed: boolean) => void
+  /** File open in Neovim (absolute path), fed by the main-process watcher. */
+  nvimFile: string | null
+  setNvimFile: (abs: string | null) => void
 }
 
-function makeChat(mode: AgentMode = 'chat'): Chat {
+function makeChat(mode: AgentMode = 'ask'): Chat {
   const now = Date.now()
   return {
     id: uid(),
@@ -192,9 +221,22 @@ export function workspaceKey(root: string): string {
   return root || '__none__'
 }
 
+/** Last path segment of a root folder, for a compact workspace label. */
+function workspaceLabel(root: string): string {
+  const trimmed = root.replace(/[\\/]+$/, '')
+  if (!trimmed) return 'No project'
+  const parts = trimmed.split(/[\\/]/)
+  return parts[parts.length - 1] || trimmed
+}
+
+function makeWorkspace(root: string): Workspace {
+  const key = workspaceKey(root)
+  return { key, root: root || null, label: workspaceLabel(root) }
+}
+
 export const useStore = create<State>((set, get) => ({
   loaded: false,
-  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {} },
+  settings: { providers: defaultProviders(), activeProviderId: 'opencode', systemPrompts: {}, mcpServers: {}, modes: [] },
   root: '',
   theme: 'dark',
   dir: 'rtl',
@@ -204,18 +246,25 @@ export const useStore = create<State>((set, get) => ({
   sidebarOpen: true,
   workspaceColors: {},
   pinnedWorkspaces: [],
+  workspaces: [],
   chats: [makeChat()],
   activeChatId: '',
   settingsOpen: false,
   isStreaming: false,
   isThinking: false,
+  outsideAllowed: false,
+  /** Absolute path of the file currently open in Neovim (null if none / unknown). */
+  nvimFile: null,
 
   load: async () => {
     const [settings, chats] = await Promise.all([
       api.storeGet<Settings>('settings'),
       api.storeGet<Chat[]>('chats'),
     ])
-    const loadedChats = chats && chats.length > 0 ? chats : [makeChat()]
+    const loadedChats0 = chats && chats.length > 0 ? chats : [makeChat()]
+    const loadedChats = loadedChats0.map((c) =>
+      c.mode ? { ...c, mode: normalizeMode(c.mode) } : c,
+    ) as Chat[]
     const activeId = loadedChats[loadedChats.length - 1]?.id ?? ''
     const raw = (settings ?? {}) as Partial<Settings> & { provider?: ProviderConfig }
 
@@ -254,11 +303,34 @@ export const useStore = create<State>((set, get) => ({
     const loadedSettings: Settings = {
       providers,
       activeProviderId,
-      systemPrompts: raw.systemPrompts ?? {},
+      systemPrompts: migrateModePrompts(raw.systemPrompts ?? {}),
+      modes: Array.isArray(raw.modes)
+        ? raw.modes.filter((m: AgentModeDef) => m && !BUILTIN_IDS.has(m.id))
+        : [],
       mcpServers: raw.mcpServers ?? {},
     }
     const fontSize = typeof raw.fontSize === 'number' && raw.fontSize >= 10 && raw.fontSize <= 24 ? raw.fontSize : 14
     document.documentElement.style.setProperty('--chat-font-size', `${fontSize}px`)
+
+    // First-class workspaces. Persisted list wins; otherwise backfill from the
+    // existing chats so the sidebar keeps showing workspaces that predate this.
+    let workspaces = Array.isArray(raw.workspaces)
+      ? raw.workspaces.map((w) => ({
+          key: String(w?.key ?? workspaceKey(String(w?.root ?? ''))),
+          root: typeof w?.root === 'string' ? w.root : null,
+          label: String(w?.label ?? '').trim() || workspaceLabel(String(w?.root ?? '')),
+        }))
+      : []
+    const chatRoots = [...new Set(loadedChats.map((c) => c.root ?? ''))]
+    if (workspaces.length === 0 && chatRoots.length > 0) {
+      workspaces = chatRoots.map(makeWorkspace)
+    } else {
+      // Make sure any workspace that has chats but no persisted entry exists.
+      const known = new Set(workspaces.map((w) => w.key))
+      for (const r of chatRoots) {
+        if (!known.has(workspaceKey(r))) workspaces.push(makeWorkspace(r))
+      }
+    }
 
     // Merge MCP connectors that the agent wrote to .coder/mcp.json into the UI
     // settings so they show up in Settings → MCP (file wins, since it may hold
@@ -280,33 +352,43 @@ export const useStore = create<State>((set, get) => ({
       sidebarOpen: raw.sidebarOpen !== false,
       workspaceColors: raw.workspaceColors ?? {},
       pinnedWorkspaces: Array.isArray(raw.pinnedWorkspaces) ? raw.pinnedWorkspaces : [],
+      workspaces,
       chats: loadedChats,
       activeChatId: activeId,
     })
   },
 
   persist: () => {
-    const { settings, chats, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, workspaceColors, pinnedWorkspaces } = get()
-    void api.storeSet('settings', { ...settings, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, workspaceColors, pinnedWorkspaces })
+    const { settings, chats, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, workspaceColors, pinnedWorkspaces, workspaces } = get()
+    void api.storeSet('settings', { ...settings, root, dir, maxHistory, recentModels, sidebarOpen, fontSize, workspaceColors, pinnedWorkspaces, workspaces })
     void api.storeSet('chats', chats)
   },
 
-  setProviderConfig: (patch) =>
-    set((s) => {
-      const id = s.settings.activeProviderId
-      const providers = s.settings.providers.map((p) => (p.id === id ? { ...p, ...patch } : p))
-      const settings = { ...s.settings, providers, activeProviderId: s.settings.activeProviderId }
-      get().persist()
-      return { settings }
-    }),
+  setProviderConfig: (patch) => {
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) =>
+          p.id === s.settings.activeProviderId ? { ...p, ...patch } : p,
+        ),
+        activeProviderId: s.settings.activeProviderId,
+      },
+    }))
+    get().persist()
+  },
 
-  updateProvider: (id, patch) =>
-    set((s) => {
-      const providers = s.settings.providers.map((p) => (p.id === id ? normalizeProvider({ ...p, ...patch }) : p))
-      const settings = { ...s.settings, providers, activeProviderId: s.settings.activeProviderId }
-      get().persist()
-      return { settings }
-    }),
+  updateProvider: (id, patch) => {
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) =>
+          p.id === id ? normalizeProvider({ ...p, ...patch }) : p,
+        ),
+        activeProviderId: s.settings.activeProviderId,
+      },
+    }))
+    get().persist()
+  },
 
   addProvider: () => {
     const id = `custom-${Date.now().toString(36)}`
@@ -326,96 +408,122 @@ export const useStore = create<State>((set, get) => ({
     return id
   },
 
-  removeProvider: (id) =>
+  removeProvider: (id) => {
     set((s) => {
       const providers = s.settings.providers.filter((p) => p.id !== id)
       const out = providers.length > 0 ? providers : defaultProviders()
-      const active = s.settings.activeProviderId === id || !out.some((p) => p.id === s.settings.activeProviderId)
-        ? out[0].id
-        : s.settings.activeProviderId
-      get().persist()
+      const active =
+        s.settings.activeProviderId === id || !out.some((p) => p.id === s.settings.activeProviderId)
+          ? out[0].id
+          : s.settings.activeProviderId
       return { settings: { ...s.settings, providers: out, activeProviderId: active } }
-    }),
+    })
+    get().persist()
+  },
 
-  setActiveProvider: (id) =>
+  setActiveProvider: (id) => {
     set((s) => {
       if (!s.settings.providers.some((p) => p.id === id)) return {}
-      get().persist()
-      return { settings: { ...s.settings, providers: s.settings.providers, activeProviderId: id } }
-    }),
+      return { settings: { ...s.settings, activeProviderId: id } }
+    })
+    get().persist()
+  },
 
-  setProviderModels: (id, models) =>
-    set((s) => {
-      const providers = s.settings.providers.map((p) =>
-        p.id === id ? { ...p, models: Array.from(new Set(models.filter(Boolean))) } : p,
-      )
-      const settings = { ...s.settings, providers, activeProviderId: s.settings.activeProviderId }
-      get().persist()
-      return { settings }
-    }),
+  setProviderModels: (id, models) => {
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) =>
+          p.id === id ? { ...p, models: Array.from(new Set(models.filter(Boolean))) } : p,
+        ),
+      },
+    }))
+    get().persist()
+  },
 
-  setProviderContextMap: (id, contextMap) =>
-    set((s) => {
-      const providers = s.settings.providers.map((p) =>
-        p.id === id ? { ...p, contextMap } : p,
-      )
-      const settings = { ...s.settings, providers, activeProviderId: s.settings.activeProviderId }
-      get().persist()
-      return { settings }
-    }),
+  setProviderContextMap: (id, contextMap) => {
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) => (p.id === id ? { ...p, contextMap } : p)),
+      },
+    }))
+    get().persist()
+  },
 
-  removeProviderModel: (id, model) =>
-    set((s) => {
-      const providers = s.settings.providers.map((p) =>
-        p.id === id ? { ...p, models: (p.models ?? []).filter((m) => m !== model) } : p,
-      )
-      const settings = { ...s.settings, providers, activeProviderId: s.settings.activeProviderId }
-      get().persist()
-      return { settings }
-    }),
+  removeProviderModel: (id, model) => {
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        providers: s.settings.providers.map((p) =>
+          p.id === id ? { ...p, models: (p.models ?? []).filter((m) => m !== model) } : p,
+        ),
+      },
+    }))
+    get().persist()
+  },
 
-  setMcpServers: (mcpServers) =>
-    set((s) => {
-      const settings = { ...s.settings, mcpServers }
-      get().persist()
-      return { settings }
-    }),
+  setMcpServers: (mcpServers) => {
+    set((s) => ({ settings: { ...s.settings, mcpServers } }))
+    get().persist()
+  },
 
-  addMcpServer: (name, cfg) =>
-    set((s) => {
-      const mcpServers = { ...(s.settings.mcpServers ?? {}), [name]: cfg }
-      const settings = { ...s.settings, mcpServers }
-      get().persist()
-      return { settings }
-    }),
+  addMcpServer: (name, cfg) => {
+    set((s) => ({
+      settings: { ...s.settings, mcpServers: { ...(s.settings.mcpServers ?? {}), [name]: cfg } },
+    }))
+    get().persist()
+  },
 
-  updateMcpServer: (name, cfg) =>
-    set((s) => {
-      const mcpServers = { ...(s.settings.mcpServers ?? {}), [name]: cfg }
-      const settings = { ...s.settings, mcpServers }
-      get().persist()
-      return { settings }
-    }),
+  updateMcpServer: (name, cfg) => {
+    set((s) => ({
+      settings: { ...s.settings, mcpServers: { ...(s.settings.mcpServers ?? {}), [name]: cfg } },
+    }))
+    get().persist()
+  },
 
-  removeMcpServer: (name) =>
+  removeMcpServer: (name) => {
     set((s) => {
       const mcpServers = { ...(s.settings.mcpServers ?? {}) }
       delete mcpServers[name]
-      const settings = { ...s.settings, mcpServers }
-      get().persist()
-      return { settings }
-    }),
+      return { settings: { ...s.settings, mcpServers } }
+    })
+    get().persist()
+  },
 
-  setSystemPrompt: (mode, text) =>
+  setSystemPrompt: (mode, text) => {
+    set((s) => ({
+      settings: {
+        ...s.settings,
+        systemPrompts: { ...(s.settings.systemPrompts ?? {}), [mode]: text },
+      },
+    }))
+    get().persist()
+  },
+
+  upsertMode: (def) => {
     set((s) => {
-      const systemPrompts = { ...(s.settings.systemPrompts ?? {}), [mode]: text }
-      const settings = { ...s.settings, systemPrompts }
-      get().persist()
-      return { settings }
-    }),
+      const modes = [...(s.settings.modes ?? [])]
+      const i = modes.findIndex((m) => m.id === def.id)
+      if (i >= 0) modes[i] = def
+      else modes.push(def)
+      return { settings: { ...s.settings, modes } }
+    })
+    get().persist()
+  },
+
+  removeMode: (id) => {
+    set((s) => {
+      const modes = (s.settings.modes ?? []).filter((m) => m.id !== id)
+      const systemPrompts = { ...(s.settings.systemPrompts ?? {}) }
+      delete systemPrompts[id]
+      return { settings: { ...s.settings, modes, systemPrompts } }
+    })
+    get().persist()
+  },
 
   setRoot: (root) => {
-    set({ root })
+    set({ root, outsideAllowed: false })
     get().persist()
   },
 
@@ -477,7 +585,7 @@ export const useStore = create<State>((set, get) => ({
   },
 
   newChat: (mode) => {
-    const chat = makeChat(mode ?? 'chat')
+    const chat = makeChat(mode ?? 'ask')
     const s = useStore.getState()
     const prevRoot = s.chats.find((c) => c.id === s.activeChatId)?.root
     const lastRoot = [...s.chats].reverse().find((c) => c.root)?.root
@@ -489,48 +597,90 @@ export const useStore = create<State>((set, get) => ({
   },
 
   newChatInRoot: (root, mode) => {
-    const chat = makeChat(mode ?? 'chat')
+    const key = workspaceKey(root ?? '')
+    const chat = makeChat(mode ?? 'ask')
     chat.root = root || undefined
     const activeChatId = chat.id
-    set((st) => ({ chats: [...st.chats, chat], activeChatId }))
+    set((st) => {
+      // Register the workspace if unknown (kept in place thereafter).
+      let workspaces = st.workspaces
+      if (!workspaces.some((w) => w.key === key)) {
+        workspaces = [...workspaces, makeWorkspace(root ?? '')]
+      }
+      return { workspaces, chats: [...st.chats, chat], activeChatId }
+    })
     get().persist()
     return activeChatId
   },
 
-  deleteChat: (id) =>
+  createWorkspace: (root) => {
+    const key = workspaceKey(root ?? '')
+    const ws = makeWorkspace(root ?? '')
+    set((s) => {
+      const workspaces = s.workspaces.some((w) => w.key === key)
+        ? s.workspaces
+        : [...s.workspaces, ws]
+      return { workspaces }
+    })
+    get().persist()
+    return key
+  },
+
+  setWorkspaceOrder: (keys) => {
+    set((s) => {
+      const ordered = [...keys]
+        .map((k) => s.workspaces.find((w) => w.key === k))
+        .filter((w): w is Workspace => Boolean(w))
+      // Keep any workspaces not present in the drag list (safety).
+      const known = new Set(ordered.map((w) => w.key))
+      for (const w of s.workspaces) if (!known.has(w.key)) ordered.push(w)
+      return { workspaces: ordered }
+    })
+    get().persist()
+  },
+
+  deleteChat: (id) => {
     set((s) => {
       const chats = s.chats.filter((c) => c.id !== id)
       const activeChatId = s.activeChatId === id ? (chats[chats.length - 1]?.id ?? '') : s.activeChatId
-      get().persist()
       return { chats, activeChatId }
-    }),
+    })
+    get().persist()
+  },
 
-  deleteWorkspace: (key) =>
+  deleteWorkspace: (key) => {
     set((s) => {
       const chats = s.chats.filter((c) => workspaceKey(c.root ?? '') !== key)
+      const workspaces = s.workspaces.filter((w) => w.key !== key)
+      const pinnedWorkspaces = s.pinnedWorkspaces.filter((k) => k !== key)
       const activeChatId = s.chats.some((c) => c.id === s.activeChatId && workspaceKey(c.root ?? '') !== key)
         ? s.activeChatId
         : chats[chats.length - 1]?.id ?? ''
-      get().persist()
-      return { chats, activeChatId }
-    }),
+      return { chats, workspaces, pinnedWorkspaces, activeChatId }
+    })
+    get().persist()
+  },
 
-  setWorkspaceColor: (key, color) =>
+  setWorkspaceColor: (key, color) => {
     set((s) => {
       const workspaceColors = { ...s.workspaceColors }
       if (color) workspaceColors[key] = color
       else delete workspaceColors[key]
-      get().persist()
       return { workspaceColors }
-    }),
+    })
+    get().persist()
+  },
 
-  togglePinWorkspace: (key) =>
+  togglePinWorkspace: (key) => {
     set((s) => {
       const wasPinned = s.pinnedWorkspaces.includes(key)
-      const pinnedWorkspaces = wasPinned ? s.pinnedWorkspaces.filter((k) => k !== key) : [key, ...s.pinnedWorkspaces]
-      get().persist()
+      const pinnedWorkspaces = wasPinned
+        ? s.pinnedWorkspaces.filter((k) => k !== key)
+        : [key, ...s.pinnedWorkspaces]
       return { pinnedWorkspaces }
-    }),
+    })
+    get().persist()
+  },
 
   setActiveChat: (id) => {
     set({ activeChatId: id })
@@ -711,6 +861,10 @@ export const useStore = create<State>((set, get) => ({
       if (s.isStreaming === active && s.isThinking === thinking) return {}
       return { isStreaming: active, isThinking: thinking }
     }),
+
+  setOutsideAllowed: (allowed) => set({ outsideAllowed: allowed }),
+
+  setNvimFile: (abs) => set({ nvimFile: abs }),
 }))
 
 export function getActiveChat(): Chat | null {
@@ -719,7 +873,7 @@ export function getActiveChat(): Chat | null {
 }
 
 export function getActiveMode(): AgentMode {
-  return getActiveChat()?.mode ?? 'chat'
+  return getActiveChat()?.mode ?? 'ask'
 }
 
 export function getActiveProvider(): ProviderConfig {
